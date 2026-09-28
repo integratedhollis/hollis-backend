@@ -5,7 +5,7 @@ Supervise Epic 2 implementation (Chat & Real-time Communication System on Cloudf
 
 ## 🔒 My Identity
 - Archetype: sentinel
-- Working directory: c:\Users\ASUS\OneDrive\Documents\GitHub\hollis-backend\.agents\sentinel
+- Working directory: c:\Users\ASUS\OneDrive\Documents\GitHub\hollis-backend\.agents\teamwork\sentinel
 - Orchestrator: ffdea2c0-c11b-4bb2-9be6-c955222b27ac
 - Victory Auditor: 00c9a32a-f83a-4eac-b622-4b227d93b770
 - Orchestrator (Epic 2): a2366ee2-004e-4b90-a6ad-3e1401fad7ea

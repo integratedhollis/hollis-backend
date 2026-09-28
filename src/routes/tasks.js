@@ -13,17 +13,31 @@
 
 import { authenticate } from '../auth/middleware.js';
 import { jsonResponse, errorResponse } from '../utils/response.js';
+import { cancelActiveSession } from '../utils/wsRegistry.js';
 
 /**
  * Main dispatcher for all /api/tasks routes.
  *
  * @param {Request} request
  * @param {Record<string, any>} env
- * @param {URL} url
- * @param {string} method
+ * @param {ExecutionContext|URL} ctxOrUrl
+ * @param {URL|string} urlOrMethod
+ * @param {string} [maybeMethod]
  * @returns {Promise<Response>}
  */
-export async function handleTasksRoute(request, env, url, method) {
+export async function handleTasksRoute(request, env, ctxOrUrl, urlOrMethod, maybeMethod) {
+  let ctx = null;
+  let url;
+  let method;
+
+  if (ctxOrUrl instanceof URL || (ctxOrUrl && typeof ctxOrUrl.pathname === 'string')) {
+    url = ctxOrUrl;
+    method = urlOrMethod;
+  } else {
+    ctx = ctxOrUrl;
+    url = urlOrMethod;
+    method = maybeMethod;
+  }
   const authResult = await authenticate(request, env);
   if (authResult instanceof Response) {
     return authResult;
@@ -291,10 +305,13 @@ async function handleCancelTask(env, user, sessionId) {
 
   const now = new Date().toISOString();
   await env.DB.prepare(
-    `UPDATE sessions SET status = 'cancelled', ended_at = ? WHERE id = ?`
+    `UPDATE sessions SET status = 'cancelled', ended_at = ? WHERE id = ? AND user_id = ?`
   )
-    .bind(now, sessionId)
+    .bind(now, sessionId, user.id)
     .run();
+
+  // Push cancellation frame and cleanly close the active socket immediately
+  cancelActiveSession(sessionId);
 
   return jsonResponse({
     session_id: sessionId,

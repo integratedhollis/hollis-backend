@@ -7,6 +7,7 @@ import { corsPreflightResponse, errorResponse, jsonResponse } from './utils/resp
 import { handleRegister, handleLogin, handleVerifyToken, handleLogout } from './routes/auth.js';
 import { handleGetMe, handleUpdateSettings } from './routes/users.js';
 import { handleTasksRoute } from './routes/tasks.js';
+import { handleWebSocketRoute } from './routes/websocket.js';
 
 export default {
   /**
@@ -84,7 +85,12 @@ export default {
 
       // Tasks routes (Session management, history, replay)
       if (path === '/api/tasks' || path.startsWith('/api/tasks/')) {
-        return await handleTasksRoute(request, env, url, method);
+        return await handleTasksRoute(request, env, ctx, url, method);
+      }
+
+      // WebSocket routes (Real-time task streaming & cancellation)
+      if (path === '/ws/tasks' || path.startsWith('/ws/tasks/')) {
+        return await handleWebSocketRoute(request, env, ctx, url);
       }
 
       // Route not found

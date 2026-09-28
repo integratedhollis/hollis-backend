@@ -1,0 +1,2 @@
+# Orchestrator Workspace for Epic 2
+Working directory initialized by Sentinel.

@@ -1,0 +1,2 @@
+# Environment secrets for local development with wrangler dev
+JWT_SECRET=your-secret-key-here-for-local-development

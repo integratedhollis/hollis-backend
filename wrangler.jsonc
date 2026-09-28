@@ -1,5 +1,5 @@
 {
-  "name": "lingering-term-dd30",
+  "name": "hollis-backend",
   "main": "src/worker.js",
   "workers_dev": true,
   "preview_urls": false,
@@ -19,5 +19,13 @@
       "persist": true,
       "head_sampling_rate": 1
     }
-  }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hollis-db",
+      "database_id": "00000000-0000-0000-0000-000000000001",
+      "migrations_dir": "migrations"
+    }
+  ]
 }

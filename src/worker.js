@@ -1,17 +1,97 @@
 /**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run "npm run dev" in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run "npm run deploy" to publish your worker
- *
- * Learn more at https://developers.cloudflare.com/workers/
+ * Hollis Backend — Cloudflare Worker Entry Point
+ * Handles request routing, CORS preflight, and top-level error boundaries.
  */
 
+import { corsPreflightResponse, errorResponse, jsonResponse } from './utils/response.js';
+import { handleRegister, handleLogin, handleVerifyToken, handleLogout } from './routes/auth.js';
+import { handleGetMe, handleUpdateSettings } from './routes/users.js';
+import { handleTasksRoute } from './routes/tasks.js';
+
 export default {
+  /**
+   * Main fetch handler for Cloudflare Workers.
+   *
+   * @param {Request} request
+   * @param {Record<string, any>} env
+   * @param {ExecutionContext} ctx
+   * @returns {Promise<Response>}
+   */
   async fetch(request, env, ctx) {
-    // You can view your logs in the Observability dashboard
-    console.info({ message: 'Hello World Worker received a request!' }); 
-    return new Response('Hello World!');
-  }
+    // Handle CORS preflight requests
+    if (request.method === 'OPTIONS') {
+      return corsPreflightResponse();
+    }
+
+    try {
+      const url = new URL(request.url);
+      const path = url.pathname;
+      const method = request.method.toUpperCase();
+
+      // Root service discovery / health check
+      if (path === '/' || path === '/health') {
+        return jsonResponse({
+          status: 'ok',
+          service: 'hollis-backend',
+          phase: 2,
+          message: 'Hollis Backend Edge Service running (Phases 1 & 2 active).',
+        });
+      }
+
+      // Authentication routes
+      if (path === '/api/auth/register') {
+        if (method !== 'POST') {
+          return errorResponse('Method Not Allowed', 405, 'method_not_allowed');
+        }
+        return await handleRegister(request, env);
+      }
+
+      if (path === '/api/auth/login') {
+        if (method !== 'POST') {
+          return errorResponse('Method Not Allowed', 405, 'method_not_allowed');
+        }
+        return await handleLogin(request, env);
+      }
+
+      if (path === '/api/auth/verify-token') {
+        if (method !== 'POST') {
+          return errorResponse('Method Not Allowed', 405, 'method_not_allowed');
+        }
+        return await handleVerifyToken(request, env);
+      }
+
+      if (path === '/api/auth/logout') {
+        if (method !== 'POST') {
+          return errorResponse('Method Not Allowed', 405, 'method_not_allowed');
+        }
+        return await handleLogout(request, env);
+      }
+
+      // User profile & settings routes
+      if (path === '/api/users/me') {
+        if (method !== 'GET') {
+          return errorResponse('Method Not Allowed', 405, 'method_not_allowed');
+        }
+        return await handleGetMe(request, env);
+      }
+
+      if (path === '/api/users/settings') {
+        if (method !== 'PUT') {
+          return errorResponse('Method Not Allowed', 405, 'method_not_allowed');
+        }
+        return await handleUpdateSettings(request, env);
+      }
+
+      // Tasks routes (Session management, history, replay)
+      if (path === '/api/tasks' || path.startsWith('/api/tasks/')) {
+        return await handleTasksRoute(request, env, url, method);
+      }
+
+      // Route not found
+      return errorResponse('Route not found.', 404, 'not_found');
+    } catch (err) {
+      console.error('Unhandled worker error:', err);
+      return errorResponse(err.message || 'Internal server error.', 500, 'internal_error');
+    }
+  },
 };

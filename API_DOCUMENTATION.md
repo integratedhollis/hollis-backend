@@ -3,8 +3,10 @@
 เอกสารข้อกำหนด API ฉบับสมบูรณ์สำหรับโปรเจกต์ **Hollis (ระบบควบคุมหน้าจอ Android ด้วย AI ผ่าน Accessibility Service)**
 เอกสารนี้จัดทำขึ้นเพื่อให้ **คนที่ 1 (Android Developer)** และทีมงานนำไปใช้เชื่อมต่อระหว่าง Android Client กับ Cloudflare Workers Backend ได้อย่างถูกต้อง แม่นยำ
 
-* **Base URL (Local Dev)**: `http://127.0.0.1:8787`
-* **Base WebSocket URL (Local Dev)**: `ws://127.0.0.1:8787`
+* **Production Base URL**: `https://hollis-backend.integrated-hollis.workers.dev`
+* **Production WebSocket URL**: `wss://hollis-backend.integrated-hollis.workers.dev`
+* **Local Dev Base URL**: `http://127.0.0.1:8787`
+* **Local Dev WebSocket URL**: `ws://127.0.0.1:8787`
 * **Content-Type**: `application/json; charset=utf-8`
 * **Authentication**: ส่ง JWT Token ผ่าน Header `Authorization: Bearer <access_token>`
 

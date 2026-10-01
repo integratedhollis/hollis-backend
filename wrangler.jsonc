@@ -1,5 +1,6 @@
 {
   "name": "hollis-backend",
+  "account_id": "0d2352e28b9c43c101cd703fd9c17ac3",
   "main": "src/worker.js",
   "workers_dev": true,
   "preview_urls": false,
@@ -23,8 +24,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "hollis-db",
-      "database_id": "00000000-0000-0000-0000-000000000001",
+      "database_name": "hollis",
+      "database_id": "af908206-3150-4454-a467-6d902dd99885",
       "migrations_dir": "migrations"
     }
   ]

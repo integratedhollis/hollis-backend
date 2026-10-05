@@ -8,21 +8,28 @@
 * **Local Dev Base URL**: `http://127.0.0.1:8787`
 * **Local Dev WebSocket URL**: `ws://127.0.0.1:8787`
 * **Content-Type**: `application/json; charset=utf-8`
-* **Authentication**: ส่ง JWT Token ผ่าน Header `Authorization: Bearer <access_token>`
+* **Primary Authentication**: **Firebase ID Token (Google Sign-In)**
+  * Android Native App ทำการล็อกอินผ่าน Google ด้วย Firebase Auth SDK
+  * ส่ง Firebase ID Token ผ่าน Header `Authorization: Bearer <firebase_id_token>` ในทุกๆ Request
+  * สำหรับ WebSocket ส่งผ่าน Query: `wss://.../ws/tasks/{session_id}?token=<firebase_id_token>`
+  * ระบบมี **Just-In-Time (JIT) Provisioning** สร้างบัญชีและค่า Setting ในฐานข้อมูล D1 อัตโนมัติเมื่อผู้ใช้ล็อกอินครั้งแรก
+* **Fallback Authentication**: Custom JWT Token สำหรับระบบเดิมและการทดสอบ
+* **Firebase Project ID**: `hollis-edd21`
 
 ---
 
 ## สารบัญ API ตามหมวดหมู่
 
-1. [กลุ่มการยืนยันตัวตน (Authentication) — Epic 1](#1-กลุ่มการยืนยันตัวตน-authentication)
-   * `POST /api/auth/register` (สมัครสมาชิกใหม่)
-   * `POST /api/auth/login` (เข้าสู่ระบบ)
-   * `POST /api/auth/verify-token` (ตรวจสอบ Token สำหรับ Splash Screen)
+1. [คู่มือการเชื่อมต่อ Firebase Google Login บน Android](#-คู่มือการเชื่อมต่อ-firebase-google-login-บน-android)
+2. [กลุ่มการยืนยันตัวตน (Authentication) — Epic 1](#1-กลุ่มการยืนยันตัวตน-authentication)
+   * `POST /api/auth/verify-token` (ตรวจสอบ Token สำหรับ Splash Screen / Token Verification)
    * `POST /api/auth/logout` (ออกจากระบบ)
-2. [กลุ่มผู้ใช้และการตั้งค่า (User & Settings) — Epic 5](#2-กลุ่มผู้ใช้และการตั้งค่า-user--settings)
+   * `POST /api/auth/login` (Fallback: เข้าสู่ระบบแบบเดิม)
+   * `POST /api/auth/register` (Fallback: สมัครสมาชิกแบบเดิม)
+3. [กลุ่มผู้ใช้และการตั้งค่า (User & Settings) — Epic 5](#2-กลุ่มผู้ใช้และการตั้งค่า-user--settings)
    * `GET /api/users/me` (ดึงข้อมูลโปรไฟล์และการตั้งค่าปัจจุบัน)
    * `PUT /api/users/settings` (อัปเดตการตั้งค่าการยืนยันความเสี่ยง)
-3. [กลุ่มการสื่อสารและงานหลัก (Chat & Tasks) — Epic 2](#3-กลุ่มการสื่อสารและงานหลัก-chat--tasks)
+4. [กลุ่มการสื่อสารและงานหลัก (Chat & Tasks) — Epic 2](#3-กลุ่มการสื่อสารและงานหลัก-chat--tasks)
    * `POST /api/tasks/start` (เริ่มสร้าง Session งานใหม่)
    * `GET /api/tasks/{session_id}/status` (Polling Fallback ตรวจสอบสถานะงาน)
    * `WS /ws/tasks/{session_id}` (ช่องทาง WebSocket สตรีม Log แบบ Real-time)
@@ -30,114 +37,106 @@
 
 ---
 
+## 🔑 คู่มือการเชื่อมต่อ Firebase Google Login บน Android
+
+### 1. การดึง Firebase ID Token บน Android (Kotlin)
+เมื่อผู้ใช้กดล็อกอินด้วย Google ผ่าน Firebase สำเร็จ ให้ดึง `idToken` ส่งมายัง Backend ดังนี้:
+
+```kotlin
+// ดึง Token ปัจจุบัน (forceRefresh = false เพื่อใช้ Token แคช หรือ true หากหมดอายุ)
+FirebaseAuth.getInstance().currentUser?.getIdToken(false)
+    ?.addOnCompleteListener { task ->
+        if (task.isSuccessful) {
+            val idToken = task.result?.token
+            // นำ idToken ไปใส่ใน Header Authorization
+            // Authorization: Bearer $idToken
+        } else {
+            // จัดการ Error เมื่อดึง Token ไม่สำเร็จ
+        }
+    }
+```
+
+### 2. การเรียกใช้ API ในทุกๆ Request
+ทุก HTTP Request ที่ส่งมายัง Backend (ไม่ว่าจะเป็น `/api/tasks/start`, `/api/users/me` ฯลฯ) ให้แนบ Header:
+```http
+Authorization: Bearer <firebase_id_token>
+```
+
+### 3. การเชื่อมต่อ WebSocket ด้วย Firebase Token
+```
+wss://hollis-backend.integrated-hollis.workers.dev/ws/tasks/{session_id}?token=<firebase_id_token>
+```
+*(Backend จะตรวจสอบความถูกต้องของ Token กับ Google JWKS และดึง/สร้าง User ใน D1 ให้ทันที)*
+
+---
+
 ## 1. กลุ่มการยืนยันตัวตน (Authentication)
 
-### 1.1 `POST /api/auth/register`
-* **บริบทหน้าจอ Android**: Popup สมัครสมาชิก (Register Popup บนหน้า Login)
-* **วัตถุประสงค์**: สร้างบัญชีผู้ใช้ใหม่ พร้อมสร้างค่าเริ่มต้นในตาราง `user_settings` ให้อัตโนมัติ และส่ง `access_token` กลับมาเพื่อให้เข้าสู่หน้าหลักได้ทันที
+### 1.1 `POST /api/auth/google-login` หรือ `POST /api/auth/verify-token` ⭐ (Endpoint หลักสำหรับ Android)
+* **บริบทหน้าจอ Android**: 
+  * ใช้เมื่อผู้ใช้กดปุ่ม **"Sign in with Google"** ในหน้า Login
+  * ใช้ในหน้า **Splash Screen** เพื่อตรวจสอบว่าผู้ใช้ยังล็อกอินอยู่หรือไม่
+* **วัตถุประสงค์**: 
+  * ส่ง Firebase ID Token ให้ Backend ตรวจสอบกับ Google
+  * Backend จะ**ดึงข้อมูลชื่อ (DisplayName), อีเมล (Gmail), รูปโปรไฟล์ (PhotoURL) และ Firebase UID ออกมาจาก Token โดยอัตโนมัติ**
+  * **Auto-Register (JIT Provisioning)**: หากผู้ใช้เพิ่งเข้าใช้งานครั้งแรก ระบบจะบันทึกข้อมูลเข้าสู่ฐานข้อมูล D1 และสร้างค่า Setting เริ่มต้นให้อัตโนมัติทันที โดยที่แอปไม่ต้องส่งข้อมูลชื่อหรืออีเมลมาเอง!
+  * หากเคยมีบัญชีแล้ว ระบบจะดึงข้อมูลเดิมขึ้นมา
 * **Headers**:
   ```http
-  Content-Type: application/json
+  Authorization: Bearer <firebase_id_token>
   ```
 * **Request Body**:
-  ```json
-  {
-    "username": "somchai",
-    "email": "somchai@example.com",
-    "password": "Password123!"
-  }
-  ```
-* **Response (Success - 201 Created)**:
-  ```json
-  {
-    "user_id": "8b5d3c87-9bb3-4ff7-b125-103328e1b641",
-    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-    "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-    "user": {
-      "id": "8b5d3c87-9bb3-4ff7-b125-103328e1b641",
-      "username": "somchai",
-      "email": "somchai@example.com"
-    }
-  }
-  ```
-* **Response (Error - 400 Bad Request)**:
-  ```json
-  {
-    "error": "email_already_exists",
-    "message": "Email is already registered."
-  }
-  ```
-* **คำแนะนำสำหรับ Android**:
-  * เมื่อได้รับ `access_token` ให้บันทึกลงใน `EncryptedSharedPreferences` หรือ `DataStore` ทันที
-  * ปิด Register Popup แล้วเปลี่ยนหน้าไปที่หน้าหลัก (Home/Chat) โดยไม่ต้องบังคับให้ผู้ใช้ล็อกอินซ้ำ
-
----
-
-### 1.2 `POST /api/auth/login`
-* **บริบทหน้าจอ Android**: หน้าเข้าสู่ระบบ (Login Screen)
-* **วัตถุประสงค์**: ยืนยันตัวตนด้วยอีเมลและรหัสผ่าน
-* **Headers**:
-  ```http
-  Content-Type: application/json
-  ```
-* **Request Body**:
-  ```json
-  {
-    "email": "somchai@example.com",
-    "password": "Password123!"
-  }
-  ```
+  * **ไม่ต้องส่ง Body ใดๆ มา** (ส่ง Body ว่างเปล่า `{}` ได้เลย)
+  * *(หรือส่ง `{ "id_token": "<firebase_id_token>" }` มาใน Body หากไม่สะดวกแนบ Header)*
 * **Response (Success - 200 OK)**:
-  ```json
-  {
-    "user_id": "8b5d3c87-9bb3-4ff7-b125-103328e1b641",
-    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-    "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-    "user": {
-      "id": "8b5d3c87-9bb3-4ff7-b125-103328e1b641",
-      "username": "somchai",
-      "email": "somchai@example.com"
-    }
-  }
-  ```
-* **Response (Error - 401 Unauthorized)**:
-  ```json
-  {
-    "error": "invalid_credentials",
-    "message": "Invalid email or password."
-  }
-  ```
-* **คำแนะนำสำหรับ Android**:
-  * หากได้ 401 ให้แสดงข้อความแจ้งเตือนใต้ช่องกรอกรหัสผ่านว่า "อีเมลหรือรหัสผ่านไม่ถูกต้อง" โดยไม่ต้องเปลี่ยนหน้า
-
----
-
-### 1.3 `POST /api/auth/verify-token`
-* **บริบทหน้าจอ Android**: หน้าจอเริ่มต้น (Splash Screen)
-* **วัตถุประสงค์**: ตรวจสอบว่า `access_token` ที่เก็บไว้ในเครื่องยังถูกต้องและไม่หมดอายุหรือไม่
-* **Headers**:
-  ```http
-  Content-Type: application/json
-  ```
-* **Request Body**:
-  ```json
-  {
-    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-  }
-  ```
-  *(หรือส่งผ่าน Header `Authorization: Bearer <token>` ได้เช่นกัน)*
-* **Response (Valid Token - 200 OK)**:
   ```json
   {
     "valid": true,
     "user_id": "8b5d3c87-9bb3-4ff7-b125-103328e1b641",
-    "user": {
-      "id": "8b5d3c87-9bb3-4ff7-b125-103328e1b641",
-      "email": "somchai@example.com",
-      "username": "somchai"
-    }
+    "email": "somchai@gmail.com",
+    "username": "Somchai Jaidee",
+    "picture": "https://lh3.googleusercontent.com/a/...",
+    "auth_provider": "firebase"
   }
   ```
+* **Response (Invalid / Expired Token - 200 OK)**:
+  ```json
+  {
+    "valid": false
+  }
+  ```
+* **คำแนะนำการทำงานบน Android**:
+  1. เมื่อผู้ใช้กดปุ่ม Sign-in with Google ผ่าน Firebase บนแอปสำเร็จ จะได้ `idToken`
+  2. ยิง `POST /api/auth/google-login` พร้อม Header `Authorization: Bearer <idToken>`
+  3. บันทึกข้อมูล Profile ที่ได้รับกลับมาลงใน Local State / SharedPrefs
+  4. นำทางเข้าสู่หน้าหลัก (Home/Chat Screen) ทันที
+  5. ในการเรียก API อื่นๆ ทั้งหมดหลังจากนี้ (เช่น สั่งงาน Task หรือคุย WebSocket) **ให้แนบ Header `Authorization: Bearer <idToken>` ไปด้วยเสมอ** ไม่ต้องเรียก API Login ซ้ำ
+
+---
+
+### 1.2 `POST /api/auth/logout`
+* **บริบทหน้าจอ Android**: ปุ่ม "ออกจากระบบ" บน Panel ตั้งค่า (Settings Panel)
+* **Headers**:
+  ```http
+  Authorization: Bearer <firebase_id_token>
+  ```
+* **Response (200 OK)**:
+  ```json
+  {
+    "status": "ok",
+    "message": "Successfully logged out."
+  }
+  ```
+* **คำแนะนำสำหรับ Android**:
+  * สั่ง `FirebaseAuth.getInstance().signOut()` บน Android
+  * ลบ Local cache และสลับกลับไปหน้า Login
+
+---
+
+### 1.3 [ระบบเดิมสำรอง] `POST /api/auth/register` และ `POST /api/auth/login` (Legacy Fallback)
+> ⚠️ **หมายเหตุ**: ส่วนนี้เป็นระบบ Email/Password ดั้งเดิมที่เก็บไว้เป็นทางเลือกสำรองสำหรับการทดสอบเท่านั้น **แอปจริงที่ใช้ Google Login ไม่ต้องเรียกใช้ 2 ตัวนี้**
+* `POST /api/auth/register` รับ `{ username, email, password }`
+* `POST /api/auth/login` รับ `{ email, password }` คืน Custom JWT Token
 * **Response (Invalid/Expired Token - 200 OK)**:
   ```json
   {

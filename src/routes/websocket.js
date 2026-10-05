@@ -14,8 +14,7 @@
  * - Graceful connection termination and cancellation handling
  */
 
-import { verifyJwt } from '../auth/jwt.js';
-import { DEFAULT_JWT_SECRET } from '../auth/middleware.js';
+import { authenticateToken } from '../auth/middleware.js';
 import { errorResponse } from '../utils/response.js';
 import { registerSession, removeSession, cancelActiveSession } from '../utils/wsRegistry.js';
 
@@ -128,13 +127,12 @@ export async function handleWebSocketRoute(request, env, ctx, url) {
     return errorResponse('Unauthorized', 401, 'unauthorized');
   }
 
-  const secret = (env && env.JWT_SECRET) || DEFAULT_JWT_SECRET;
-  const authResult = await verifyJwt(token, secret);
-  if (!authResult.valid || !authResult.payload || authResult.payload.type !== 'access') {
+  const authData = await authenticateToken(token, env);
+  if (!authData || !authData.user) {
     return errorResponse('Unauthorized', 401, 'unauthorized');
   }
 
-  const payload = authResult.payload;
+  const user = authData.user;
 
   // 4. Verify session existence and user ownership in Cloudflare D1
   const session = await env.DB.prepare(
@@ -143,7 +141,7 @@ export async function handleWebSocketRoute(request, env, ctx, url) {
     .bind(sessionId)
     .first();
 
-  if (!session || session.user_id !== payload.sub) {
+  if (!session || session.user_id !== user.id) {
     return errorResponse('Session not found', 404, 'not_found');
   }
 

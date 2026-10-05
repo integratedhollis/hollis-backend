@@ -9,7 +9,7 @@
 
 import { hashPassword, verifyPassword } from '../auth/crypto.js';
 import { signJwt, verifyJwt } from '../auth/jwt.js';
-import { DEFAULT_JWT_SECRET } from '../auth/middleware.js';
+import { DEFAULT_JWT_SECRET, authenticateToken } from '../auth/middleware.js';
 import { jsonResponse, errorResponse } from '../utils/response.js';
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -182,8 +182,14 @@ export async function handleVerifyToken(request, env) {
   if (contentType.includes('application/json')) {
     try {
       const body = await request.json();
-      if (body && typeof body.token === 'string') {
-        token = body.token.trim();
+      if (body) {
+        if (typeof body.token === 'string') {
+          token = body.token.trim();
+        } else if (typeof body.access_token === 'string') {
+          token = body.access_token.trim();
+        } else if (typeof body.id_token === 'string') {
+          token = body.id_token.trim();
+        }
       }
     } catch {
       // Body is not valid JSON or empty, fall through to header
@@ -202,18 +208,18 @@ export async function handleVerifyToken(request, env) {
     return jsonResponse({ valid: false });
   }
 
-  const secret = env.JWT_SECRET || DEFAULT_JWT_SECRET;
-  const result = await verifyJwt(token, secret);
-
-  if (!result.valid || !result.payload || result.payload.type !== 'access') {
+  const authData = await authenticateToken(token, env);
+  if (!authData || !authData.user) {
     return jsonResponse({ valid: false });
   }
 
   return jsonResponse({
     valid: true,
-    user_id: result.payload.sub,
-    email: result.payload.email,
-    username: result.payload.username,
+    user_id: authData.user.id,
+    email: authData.user.email,
+    username: authData.user.username,
+    picture: authData.user.picture || null,
+    auth_provider: authData.user.auth_provider,
   });
 }
 

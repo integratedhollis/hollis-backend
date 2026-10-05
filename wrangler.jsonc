@@ -5,6 +5,9 @@
   "workers_dev": true,
   "preview_urls": false,
   "compatibility_date": "2026-09-07",
+  "vars": {
+    "FIREBASE_PROJECT_ID": "hollis-edd21"
+  },
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1,

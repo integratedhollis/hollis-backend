@@ -54,7 +54,7 @@ export default {
         return await handleLogin(request, env);
       }
 
-      if (path === '/api/auth/verify-token') {
+      if (path === '/api/auth/verify-token' || path === '/api/auth/google-login') {
         if (method !== 'POST') {
           return errorResponse('Method Not Allowed', 405, 'method_not_allowed');
         }

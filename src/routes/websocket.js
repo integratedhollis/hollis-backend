@@ -194,7 +194,7 @@ export async function handleWebSocketRoute(request, env, ctx, url) {
   registerSession(sessionId, {
     ws: server,
     abortController,
-    userId: payload.sub,
+    userId: user.id,
   });
 
   // 7. Send initial connected event
@@ -259,7 +259,7 @@ export async function handleWebSocketRoute(request, env, ctx, url) {
         await env.DB.prepare(
           `UPDATE sessions SET status = 'cancelled', ended_at = ? WHERE id = ? AND user_id = ?`
         )
-          .bind(now, sessionId, payload.sub)
+          .bind(now, sessionId, user.id)
           .run();
 
         cancelActiveSession(sessionId);
@@ -284,7 +284,7 @@ export async function handleWebSocketRoute(request, env, ctx, url) {
   // 9. Start background mock log streaming via ctx.waitUntil
   const streamingPromise = streamMockLogs(
     sessionId,
-    payload.sub,
+    user.id,
     server,
     env,
     abortController.signal

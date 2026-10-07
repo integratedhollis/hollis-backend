@@ -30,12 +30,12 @@ export default {
       const method = request.method.toUpperCase();
 
       // Root service discovery / health check
-      if (path === '/' || path === '/health') {
+      if (path === '/' || path === '/health' || path === '/api/health') {
         return jsonResponse({
           status: 'ok',
           service: 'hollis-backend',
-          phase: 2,
-          message: 'Hollis Backend Edge Service running (Phases 1 & 2 active).',
+          phase: 3,
+          message: 'Hollis Backend Edge Service running (Phases 1, 2 & 3 active).',
         });
       }
 

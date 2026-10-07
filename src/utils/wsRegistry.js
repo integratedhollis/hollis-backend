@@ -31,6 +31,9 @@ export function registerSession(sessionId, sessionData) {
 
   // If a previous connection existed for this sessionId, cleanly abort and close it
   if (existing && existing.ws !== sessionData.ws) {
+    if (existing.agentLoop) {
+      existing.agentLoop.isSuperseded = true;
+    }
     try {
       existing.abortController?.abort();
     } catch (err) {
@@ -38,9 +41,7 @@ export function registerSession(sessionId, sessionData) {
     }
     try {
       existing.ws?.close(1000, 'Replaced by new connection');
-    } catch (err) {
-      console.warn(`[wsRegistry] Failed to close previous WebSocket for ${sessionId}:`, err);
-    }
+    } catch (_) {}
   }
 
   return sessionData;
@@ -95,7 +96,14 @@ export function cancelActiveSession(sessionId) {
     return false;
   }
 
-  // 1. Send cancellation frame to client
+  // 1. Abort controller to signal the active WebSocket loop
+  try {
+    session.abortController?.abort();
+  } catch (err) {
+    console.warn(`[wsRegistry] Failed to abort controller for session ${sessionId}:`, err);
+  }
+
+  // 2. Attempt to push cancellation frame directly if running in same isolate
   try {
     session.ws.send(
       JSON.stringify({
@@ -105,23 +113,12 @@ export function cancelActiveSession(sessionId) {
         summary_message: 'งานถูกยกเลิกโดยผู้ใช้',
       })
     );
-  } catch (err) {
-    console.warn(`[wsRegistry] Failed to send cancel frame for session ${sessionId}:`, err);
-  }
+  } catch (_) {}
 
-  // 2. Abort controller to halt any active delay or background task loop
-  try {
-    session.abortController?.abort();
-  } catch (err) {
-    console.warn(`[wsRegistry] Failed to abort controller for session ${sessionId}:`, err);
-  }
-
-  // 3. Close the WebSocket connection cleanly
+  // 3. Attempt clean WebSocket closure
   try {
     session.ws.close(1000, 'Task cancelled by user');
-  } catch (err) {
-    console.warn(`[wsRegistry] Failed to close WebSocket for session ${sessionId}:`, err);
-  }
+  } catch (_) {}
 
   // 4. Remove from active registry safely
   removeSession(sessionId, session.ws);

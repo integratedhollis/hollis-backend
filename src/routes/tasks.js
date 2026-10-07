@@ -13,7 +13,7 @@
 
 import { authenticate } from '../auth/middleware.js';
 import { jsonResponse, errorResponse } from '../utils/response.js';
-import { cancelActiveSession } from '../utils/wsRegistry.js';
+import { cancelActiveSession, getSession } from '../utils/wsRegistry.js';
 
 /**
  * Main dispatcher for all /api/tasks routes.
@@ -369,6 +369,12 @@ async function handleConfirmTask(request, env, user, sessionId) {
       .run();
   }
 
+  // Notify active Agent Loop if session is currently connected via WebSocket
+  const active = getSession(sessionId);
+  if (active && active.agentLoop) {
+    active.agentLoop.handleConfirm({ approved });
+  }
+
   return jsonResponse({
     session_id: sessionId,
     status: 'ok',
@@ -413,5 +419,6 @@ async function handleGetTaskLogs(env, user, sessionId) {
   return jsonResponse({
     session_id: sessionId,
     logs,
+    steps: logs,
   });
 }

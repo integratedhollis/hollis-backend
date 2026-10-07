@@ -150,6 +150,39 @@ async function apiRequest(path, options = {}) {
   }
 
   const start = Date.now();
+
+  if (headers['Upgrade'] || headers['upgrade']) {
+    return new Promise((resolve, reject) => {
+      const u = new URL(url);
+      const mod = u.protocol === 'https:' ? require('node:https') : require('node:http');
+      const req = mod.request(u, {
+        method: options.method || 'GET',
+        headers,
+      }, (res) => {
+        let raw = '';
+        res.on('data', (chunk) => { raw += chunk; });
+        res.on('end', () => {
+          let json = null;
+          try { json = JSON.parse(raw); } catch (_) {}
+          resolve({
+            status: res.statusCode,
+            statusText: res.statusMessage,
+            headers: res.headers,
+            body: json,
+            rawText: raw,
+            durationMs: Date.now() - start,
+          });
+        });
+      });
+      req.on('error', (err) => {
+        const durationMs = Date.now() - start;
+        reject(new Error(`HTTP Request Failed (${options.method || 'GET'} ${url}) after ${durationMs}ms: ${err.message}`));
+      });
+      if (body) req.write(body);
+      req.end();
+    });
+  }
+
   let response;
   try {
     response = await fetch(url, {

@@ -28,7 +28,7 @@ import { check_tree_quality } from './src/ai/treeQuality.js';
 import { check_risk, DEFAULT_RISK_KEYWORDS } from './src/ai/riskEngine.js';
 import { verify_step } from './src/ai/diffEngine.js';
 import { decide_action, AIAdapter } from './src/ai/adapter.js';
-import { formatTreeForPrompt } from './src/ai/groq.js';
+import { formatTreeForPrompt, formatElementsToOneLine, HOLLIS_TOOLS } from './src/ai/groq.js';
 
 // ============================================================================
 // CLI & URL Setup
@@ -330,7 +330,29 @@ async function main() {
     assertEqual(res.clickable_nodes, 0);
   });
 
-  await test('TreeQuality: Rich hierarchy with clickable and text elements selects Text Mode', () => {
+  await test('TreeQuality: Canvas or SurfaceView flag strictly falls back to Vision Mode', () => {
+    const canvasTree = { is_canvas: true, class: 'io.flutter.embedding.android.FlutterSurfaceView' };
+    const res = check_tree_quality(canvasTree);
+    assertEqual(res.mode, 'vision', 'Canvas screen must use vision mode');
+    assertEqual(res.sufficient, false);
+  });
+
+  await test('TreeQuality: Less than 2 interactive nodes falls back to Vision Mode per specification', () => {
+    // Only 1 clickable button (< 2 interactive nodes)
+    const singleButtonTree = {
+      class: 'android.widget.FrameLayout',
+      children: [
+        { class: 'android.widget.Button', text: 'ตกลง', clickable: true },
+        { class: 'android.widget.TextView', text: 'ข้อความแจ้งเตือน' },
+      ],
+    };
+    const res = check_tree_quality(singleButtonTree);
+    assertEqual(res.mode, 'vision', 'Less than 2 interactive nodes must fall back to vision');
+    assertEqual(res.sufficient, false);
+    assert(res.interactive_nodes === 1, 'Should record exactly 1 interactive node');
+  });
+
+  await test('TreeQuality: Rich hierarchy with >= 2 interactive elements selects Text Mode', () => {
     const richTree = {
       class: 'android.widget.LinearLayout',
       clickable: false,
@@ -345,27 +367,61 @@ async function main() {
           text: 'ส่งเงิน',
           clickable: true,
         },
+        {
+          class: 'android.widget.EditText',
+          text: 'กรอกจำนวนเงิน',
+          editable: true,
+        },
       ],
     };
     const res = check_tree_quality(richTree);
-    assertEqual(res.mode, 'text', 'Rich tree should select text mode');
+    assertEqual(res.mode, 'text', 'Rich tree with >= 2 interactive nodes should select text mode');
     assertEqual(res.sufficient, true);
-    assert(res.clickable_nodes >= 1, 'Should count clickable nodes');
+    assert(res.interactive_nodes >= 2, 'Should count interactive nodes >= 2');
     assert(res.text_elements >= 1, 'Should count text elements');
     assert(res.depth >= 2, 'Should compute depth');
   });
 
-  await test('TreeQuality: Formats tree into prompt-friendly compact format', () => {
-    const tree = {
-      id: 'root',
-      class: 'android.widget.LinearLayout',
-      children: [
-        { id: 'btn_1', class: 'Button', text: 'Confirm', clickable: true },
-      ],
-    };
-    const formatted = formatTreeForPrompt(tree);
-    assert(typeof formatted === 'string' && formatted.includes('btn_1'));
-    assert(formatted.includes('Confirm'));
+  await test('TreeQuality: Formats pruned elements into One-line String format per specification', () => {
+    const prunedElements = [
+      { id: 0, class: 'android.widget.Button', text: 'ส่งเงิน', clickable: true },
+      { id: 1, class: 'android.widget.EditText', text: 'ค้นหาเพื่อน', editable: true },
+      { id: 2, class: 'android.widget.TextView', text: 'ยอดคงเหลือ 500 บาท' },
+    ];
+    const formatted = formatElementsToOneLine(prunedElements);
+    assert(typeof formatted === 'string');
+    assert(formatted.includes('[0] Button "ส่งเงิน" (clickable)'));
+    assert(formatted.includes('[1] EditText "ค้นหาเพื่อน" (editable)'));
+    assert(formatted.includes('[2] TextView "ยอดคงเหลือ 500 บาท"'));
+  });
+
+  await test('ToolCalling: HOLLIS_TOOLS defines all 8 required tools with valid schema', () => {
+    assert(Array.isArray(HOLLIS_TOOLS), 'HOLLIS_TOOLS must be an array');
+    assertEqual(HOLLIS_TOOLS.length, 8, 'Must define exactly 8 tools');
+
+    const toolNames = HOLLIS_TOOLS.map((t) => t.function.name);
+    const expected = [
+      'click_element',
+      'click_coordinate',
+      'input_text',
+      'swipe_screen',
+      'system_navigation',
+      'wait_and_poll',
+      'task_finish',
+      'open_app',
+    ];
+
+    for (const name of expected) {
+      assert(toolNames.includes(name), `Missing tool: ${name}`);
+    }
+
+    const clickElem = HOLLIS_TOOLS.find((t) => t.function.name === 'click_element');
+    assertEqual(clickElem.function.parameters.properties.element_id.type, 'integer');
+    assert(clickElem.function.parameters.required.includes('element_id'));
+
+    const openApp = HOLLIS_TOOLS.find((t) => t.function.name === 'open_app');
+    assertEqual(openApp.function.parameters.properties.app_name.type, 'string');
+    assert(openApp.function.parameters.required.includes('app_name'));
   });
 
   // --------------------------------------------------------------------------
@@ -498,19 +554,41 @@ async function main() {
     const richTree = {
       class: 'android.widget.LinearLayout',
       children: [
-        { class: 'android.widget.Button', text: 'เปิดแอป LINE', clickable: true },
+        { id: 0, class: 'android.widget.Button', text: 'ค้นหาเพื่อน', clickable: true },
+        { id: 1, class: 'android.widget.Button', text: 'ส่งข้อความ', clickable: true },
       ],
     };
 
     const decision = await decide_action({
-      instruction: 'เปิดแอป LINE',
+      instruction: 'ค้นหาเพื่อน',
       screen_tree: richTree,
     });
 
     assertEqual(decision.mode_used, 'text', 'Should select text mode for rich tree');
+    assert(typeof decision.tool_name === 'string', 'Should return tool_name');
     assert(typeof decision.action_type === 'string', 'Should return action_type');
+    assertEqual(decision.tool_name, 'click_element', 'Should default to click_element');
+    assert(typeof decision.element_id === 'number', 'element_id must be a number');
     assert(typeof decision.log_message === 'string', 'Should return log_message');
     assertEqual(decision.tree_quality.sufficient, true);
+  });
+
+  await test('Adapter: Selects open_app when instruction requests launching an application', async () => {
+    const decision = await decide_action({
+      instruction: 'เปิดแอป LINE ให้หน่อย',
+      screen_tree: {
+        class: 'android.widget.FrameLayout',
+        children: [
+          { id: 0, class: 'Button', text: 'หน้าแรก', clickable: true },
+          { id: 1, class: 'Button', text: 'เมนู', clickable: true },
+        ],
+      },
+    });
+
+    assertEqual(decision.tool_name, 'open_app');
+    assertEqual(decision.parameters.app_name, 'LINE');
+    assertEqual(decision.parameters.package_name, 'jp.naver.line.android');
+    assert(decision.log_message.includes('LINE'));
   });
 
   await test('Adapter: Selects Vision Mode when tree is empty or insufficient', async () => {
@@ -604,13 +682,14 @@ async function main() {
 
       await client.waitForMessage((m) => m && m.event === 'connected', 4000);
 
-      // Client sends observe frame
+      // Client sends observe frame (Pruned elements with interactive elements)
       client.send({
         event: 'observe',
         screen_tree: {
           class: 'android.widget.FrameLayout',
           children: [
-            { class: 'android.widget.Button', text: 'ค้นหารายการ', clickable: true },
+            { id: 0, class: 'android.widget.Button', text: 'ค้นหารายการ', clickable: true },
+            { id: 1, class: 'android.widget.Button', text: 'ตกลง', clickable: true },
           ],
         },
       });
@@ -624,6 +703,7 @@ async function main() {
       assert(actionFrame !== null, 'Client must receive action frame');
       assertEqual(actionFrame.session_id, sessionId);
       assert(typeof actionFrame.action === 'object', 'action must be an object');
+      assert(actionFrame.tool !== undefined || actionFrame.tool_name !== undefined, 'action frame must specify tool');
 
       // Client responds with action_done (simulating execution with updated UI)
       client.send({

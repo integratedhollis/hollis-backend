@@ -142,16 +142,49 @@ Analyze the attached screen screenshot and return the next action JSON.`;
       }
     }
 
+    let toolName = 'click_coordinate';
+    let params = {};
+
+    if (parsedAction.action_type === 'complete' || parsedAction.is_completed) {
+      toolName = 'task_finish';
+      params = {
+        status: 'success',
+        message: parsedAction.log_message || 'ภารกิจเสร็จสิ้นเรียบร้อยแล้ว',
+      };
+    } else if (parsedAction.action_type === 'back' || parsedAction.action_type === 'home') {
+      toolName = 'system_navigation';
+      params = {
+        action: parsedAction.action_type.toUpperCase(),
+      };
+    } else if (parsedAction.action_type === 'scroll_down' || parsedAction.action_type === 'scroll_up') {
+      toolName = 'swipe_screen';
+      params = {
+        direction: parsedAction.action_type === 'scroll_down' ? 'DOWN' : 'UP',
+      };
+    } else {
+      toolName = 'click_coordinate';
+      params = {
+        x: parsedAction.coordinates?.x !== undefined ? Math.round(parsedAction.coordinates.x * 1000) / 1000 : 0.5,
+        y: parsedAction.coordinates?.y !== undefined ? Math.round(parsedAction.coordinates.y * 1000) / 1000 : 0.5,
+        target_description: parsedAction.target || 'จุดเป้าหมายจากภาพหน้าจอ',
+      };
+    }
+
     return {
-      action_type: parsedAction.action_type || 'tap',
-      target: parsedAction.target || 'target element from vision',
-      coordinates: parsedAction.coordinates || null,
+      action_type: toolName,
+      tool_name: toolName,
+      parameters: params,
+      element_id: null,
+      target: parsedAction.target || params.target_description || 'target from vision',
+      target_id: null,
+      coordinates: parsedAction.coordinates || (params.x !== undefined ? { x: params.x, y: params.y } : null),
       text: parsedAction.text || null,
-      log_message: parsedAction.log_message || `ตรวจพบและดำเนินการ ${parsedAction.action_type || 'tap'} บน ${parsedAction.target || ''}`,
-      is_completed: Boolean(parsedAction.is_completed),
+      log_message: parsedAction.log_message || `ตรวจพบและดำเนินการ ${toolName}`,
+      is_completed: toolName === 'task_finish',
       raw_response: data,
     };
   } finally {
     clearTimeout(timer);
   }
 }
+

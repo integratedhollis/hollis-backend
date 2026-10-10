@@ -404,11 +404,17 @@ export class AgentLoop {
 
         this.currentStep = nextStepNo;
 
+        const toolName = decision.tool_name || decision.action_type || 'click_element';
+        const toolParams = decision.parameters || {};
+
         this.sendFrame({
           event: 'action',
           session_id: this.sessionId,
           step_no: nextStepNo,
           step_id: stepId,
+          tool: toolName,
+          tool_name: toolName,
+          parameters: toolParams,
           action: decision,
           mode_used: decision.mode_used,
           is_risky: isRisky,
@@ -421,8 +427,35 @@ export class AgentLoop {
           log_message: decision.log_message,
           timestamp,
           is_risky: isRisky,
-          action_type: decision.action_type,
+          action_type: toolName,
+          tool_name: toolName,
         });
+
+        const isTaskFinish =
+          decision.is_completed ||
+          toolName === 'task_finish' ||
+          decision.action_type === 'complete' ||
+          decision.action_type === 'task_finish';
+
+        if (isTaskFinish) {
+          this.status = 'completed';
+          const endedAt = new Date().toISOString();
+          await this.env.DB.prepare(
+            `UPDATE sessions SET status = 'completed', ended_at = ? WHERE id = ? AND user_id = ? AND status = 'running'`
+          ).bind(endedAt, this.sessionId, this.userId).run();
+
+          const summaryMsg = toolParams.message || decision.log_message || 'งานเสร็จสมบูรณ์เรียบร้อยแล้ว';
+          this.sendFrame({
+            event: 'finished',
+            session_id: this.sessionId,
+            status: 'completed',
+            total_steps: this.currentStep,
+            step_count: this.currentStep,
+            summary_message: summaryMsg,
+          });
+          try { this.ws?.close(1000, 'Task completed successfully'); } catch (_) {}
+          break;
+        }
 
         // Wait for action execution
         let stateAfter = null;
@@ -453,8 +486,11 @@ export class AgentLoop {
             };
           }
         } else {
-          // Autonomous delay ~300ms (abortable)
-          await abortableSleep(300, this.abortController.signal);
+          // Autonomous delay (respect wait_and_poll duration if specified)
+          const delayMs = toolName === 'wait_and_poll' && toolParams.duration_ms
+            ? Math.max(500, Math.min(3000, Number(toolParams.duration_ms)))
+            : 300;
+          await abortableSleep(delayMs, this.abortController.signal);
 
           // Check DB cancellation right after sleep
           const postSleepSession = await this.env.DB.prepare(
@@ -508,27 +544,7 @@ export class AgentLoop {
 
         // --- TERMINATION CHECKS ---
 
-        // 1. Goal Completed
-        if (decision.is_completed || decision.action_type === 'complete') {
-          this.status = 'completed';
-          const endedAt = new Date().toISOString();
-          await this.env.DB.prepare(
-            `UPDATE sessions SET status = 'completed', ended_at = ? WHERE id = ? AND user_id = ? AND status = 'running'`
-          ).bind(endedAt, this.sessionId, this.userId).run();
-
-          this.sendFrame({
-            event: 'finished',
-            session_id: this.sessionId,
-            status: 'completed',
-            total_steps: this.currentStep,
-            step_count: this.currentStep,
-            summary_message: 'งานเสร็จสมบูรณ์เรียบร้อยแล้ว',
-          });
-          try { this.ws?.close(1000, 'Task completed successfully'); } catch (_) {}
-          break;
-        }
-
-        // 2. Loop Detection
+        // 1. Loop Detection
         if (verifiedChanged === 0) {
           this.unchangedStreak++;
         } else {

@@ -20,15 +20,25 @@ function traverseTree(node, depth, stats, visited = new Set()) {
     stats.maxDepth = depth;
   }
 
-  // Check if node is interactive/clickable
+  // Check if node is interactive (clickable, editable, checkable)
   const isClickable =
     Boolean(node.clickable) ||
     Boolean(node.is_clickable) ||
     node.action === 'click' ||
     (Array.isArray(node.actions) && node.actions.includes('click'));
 
-  if (isClickable) {
-    stats.clickableNodes++;
+  const isEditable =
+    Boolean(node.editable) ||
+    Boolean(node.is_editable) ||
+    (typeof node.class === 'string' && node.class.toLowerCase().includes('edittext'));
+
+  const isCheckable =
+    Boolean(node.checkable) ||
+    Boolean(node.is_checkable);
+
+  if (isClickable || isEditable || isCheckable) {
+    stats.interactiveNodes++;
+    if (isClickable) stats.clickableNodes++;
   }
 
   // Check if node has non-empty text or content description
@@ -48,11 +58,16 @@ function traverseTree(node, depth, stats, visited = new Set()) {
 
 /**
  * Evaluates accessibility tree quality to determine optimal AI processing mode.
+ * Per Architecture Spec (Hybrid Fallback Trigger):
+ * - If interactive nodes < 2 or Canvas/SurfaceView/empty tree -> Vision Mode
+ * - Otherwise (>= 2 interactive nodes or sufficient hierarchy) -> Text Mode
  *
  * @param {any} screenTree - Accessibility tree hierarchy (JSON object or string)
  * @returns {{
  *   mode: 'text' | 'vision',
  *   sufficient: boolean,
+ *   interactiveCount: number,
+ *   interactive_nodes: number,
  *   clickableCount: number,
  *   clickable_nodes: number,
  *   textCount: number,
@@ -78,6 +93,8 @@ export function checkTreeQuality(screenTree) {
     return {
       mode: 'vision',
       sufficient: false,
+      interactiveCount: 0,
+      interactive_nodes: 0,
       clickableCount: 0,
       clickable_nodes: 0,
       textCount: 0,
@@ -90,9 +107,35 @@ export function checkTreeQuality(screenTree) {
     };
   }
 
-  const root = tree.nodes || tree.root || tree.hierarchy || tree;
+  // Canvas / SurfaceView override detection
+  const isCanvas =
+    Boolean(tree.is_canvas) ||
+    Boolean(tree.is_surface_view) ||
+    Boolean(tree.canvas) ||
+    (typeof tree.class === 'string' && (tree.class.includes('SurfaceView') || tree.class.includes('TextureView') || tree.class.includes('GLSurfaceView')));
+
+  if (isCanvas) {
+    return {
+      mode: 'vision',
+      sufficient: false,
+      interactiveCount: 0,
+      interactive_nodes: 0,
+      clickableCount: 0,
+      clickable_nodes: 0,
+      textCount: 0,
+      text_elements: 0,
+      totalNodes: 1,
+      total_nodes: 1,
+      maxDepth: 1,
+      depth: 1,
+      reason: 'Screen renders Canvas or SurfaceView (e.g. Flutter Canvas/Game). Switching to Vision Mode.',
+    };
+  }
+
+  const root = tree.screen_elements || tree.elements || tree.nodes || tree.root || tree.hierarchy || tree;
   const stats = {
     totalNodes: 0,
+    interactiveNodes: 0,
     clickableNodes: 0,
     textNodes: 0,
     maxDepth: 0,
@@ -107,11 +150,13 @@ export function checkTreeQuality(screenTree) {
     traverseTree(root, 1, stats, visited);
   }
 
-  // If tree has virtually no actionable elements (e.g. WebView, games, camera canvas)
-  if (stats.clickableNodes === 0 && stats.textNodes === 0) {
+  // Hybrid Fallback Trigger: if interactive nodes < 2 (or 0 clickable & 0 text)
+  if (stats.interactiveNodes < 2 && stats.clickableNodes < 2) {
     return {
       mode: 'vision',
       sufficient: false,
+      interactiveCount: stats.interactiveNodes,
+      interactive_nodes: stats.interactiveNodes,
       clickableCount: stats.clickableNodes,
       clickable_nodes: stats.clickableNodes,
       textCount: stats.textNodes,
@@ -120,14 +165,16 @@ export function checkTreeQuality(screenTree) {
       total_nodes: stats.totalNodes,
       maxDepth: stats.maxDepth,
       depth: stats.maxDepth,
-      reason: 'No clickable elements or text found in tree (likely WebView/Canvas/Game). Switching to Vision Mode.',
+      reason: `Insufficient interactive nodes (${stats.interactiveNodes} < 2). Switching to Vision Mode per specification.`,
     };
   }
 
-  // Sufficient semantic information for Text Mode
+  // Sufficient semantic information for Text Mode (>= 2 interactive nodes)
   return {
     mode: 'text',
     sufficient: true,
+    interactiveCount: stats.interactiveNodes,
+    interactive_nodes: stats.interactiveNodes,
     clickableCount: stats.clickableNodes,
     clickable_nodes: stats.clickableNodes,
     textCount: stats.textNodes,
@@ -136,7 +183,7 @@ export function checkTreeQuality(screenTree) {
     total_nodes: stats.totalNodes,
     maxDepth: stats.maxDepth,
     depth: stats.maxDepth,
-    reason: `Sufficient tree hierarchy found (${stats.clickableNodes} clickable, ${stats.textNodes} text nodes). Using Text Mode (Groq / gpt-oss-120b).`,
+    reason: `Sufficient tree hierarchy found (${stats.interactiveNodes} interactive, ${stats.textNodes} text nodes). Using Text Mode (Groq / gpt-oss-120b).`,
   };
 }
 

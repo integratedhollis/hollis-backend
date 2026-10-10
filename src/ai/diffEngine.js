@@ -67,7 +67,8 @@ function flattenTree(root) {
 
     const key = node.id || node.resource_id || path;
     const text = (node.text || node.content_description || node.label || '').trim();
-    const className = node.class || node.type || '';
+    const rawClass = node.class || node.type || '';
+    const className = typeof rawClass === 'string' ? rawClass.split('.').pop() : '';
     const clickable = Boolean(node.clickable || node.is_clickable);
     const bounds = typeof node.bounds === 'object' ? JSON.stringify(node.bounds) : String(node.bounds || '');
 

@@ -513,58 +513,62 @@ val webSocket = client.newWebSocket(request, object : WebSocketListener() {
 
 ---
 
-## 4. ระบบควบคุมหน้าจอและ AI Agent Loop (Screen Control & Agent Loop) — Epic 3
+## 4. ระบบควบคุมหน้าจอและ AI Agent Loop (Mobile Agent System) — Epic 3
 
-ระบบควบคุมหน้าจอดำเนินการผ่านวงรอบอัจฉริยะ **5-Step Agent Loop** แบบ 2 ทาง (Duplex) ระหว่าง Cloudflare Workers Backend กับ Android Client ผ่าน WebSocket:
+ระบบควบคุมหน้าจอดำเนินการผ่านวงรอบอัจฉริยะ **ReAct Agent Loop (Observe-Reason-Act-Verify)** แบบ 2 ทาง (Duplex) ระหว่าง Cloudflare Workers Backend กับ Android Client ผ่านช่องทาง WebSocket พร้อมกลไก **Strict Tool Calling (7 Tools มาตรฐาน)** และ **In-Memory Element ID Mapping**:
 
 ```
-    ┌───────────┐       observe (screen_tree/screenshot)       ┌──────────────┐
+    ┌───────────┐      observe (screen_elements: id: 0, 1, 2)     ┌──────────────┐
     │           │ <─────────────────────────────────────────── │              │
     │           │                 1. Observe                   │              │
-    │  Hollis   │                 2. Decide (Text vs Vision)   │   Android    │
+    │  Hollis   │                 2. Decide (Groq / OpenRouter)│   Android    │
     │  Backend  │                 3. Risk Check                │ Accessibility│
     │(AI Agent) │                                              │   Service    │
-    │           │       action / log / confirmation            │              │
-    │           │ ───────────────────────────────────────────> │              │
-    │           │                 4. Act                       │              │
+    │           │      action: tool_name + typed parameters    │ (In-Memory   │
+    │           │ ───────────────────────────────────────────> │  Cache Map)  │
+    │           │                 4. Act (Execution Precedence)│              │
     │           │ <─────────────────────────────────────────── │              │
-    │           │      action_done (new screen_tree)           │              │
+    │           │      action_done (new screen_elements)       │              │
     └───────────┘                 5. Verify (DOM Diff)         └──────────────┘
 ```
 
 ---
 
-### 4.1 วงรอบการทำงาน 5 ขั้นตอน (5-Step Agent Loop Cycle)
+### 4.1 วงรอบการทำงาน (ReAct Loop Lifecycle)
 
-1. **Observe (สังเกตการณ์)**:
-   * Client ส่งข้อมูลหน้าจอปัจจุบันประกอบด้วย Accessibility Hierarchy Tree (`screen_tree`) และภาพหน้าจอ Base64 (`screenshot` เมื่อจำเป็น)
-2. **Decide (ตัดสินใจ)**:
-   * **Tree Quality Engine (`check_tree_quality`)**: วิเคราะห์จำนวน Clickable Nodes, Text Elements, Total Nodes และระดับความลึก (Hierarchy Depth)
-   * **Text Mode (ความเร็วสูง & ประหยัดต้นทุน)**: หาก Accessibility Tree มีความสมบูรณ์เพียงพอ ระบบจะเลือกใช้ Groq Cloud (`gpt-oss-120b`) ในรูปแบบ JSON Structured Output
-   * **Vision Mode (วิเคราะห์รูปภาพ)**: หาก Accessibility Tree ว่างเปล่าหรือเป็น Custom Canvas/Game/WebView ระบบจะสลับไปใช้ OpenRouter (`Qwen3-VL`) พร้อมส่งภาพ Screenshot ไปวิเคราะห์
+1. **Observe (สังเกตการณ์ & Semantic Pruning)**:
+   * ฝั่ง Android ทำการ Prune เฉพาะโหนดที่มีคุณสมบัติ `isVisibleToUser == true` และ Interactive (`isClickable`, `isEditable`, `isCheckable` หรือมี `text`/`contentDescription`) พร้อมกำหนดรหัสลำดับ **`id: 0, 1, 2, ...`** ลงใน In-Memory Cache บนมือถือ
+   * ส่ง Array `screen_elements` ขึ้นมายัง Backend
+   * **Hybrid Fallback Trigger**: หากพบ Interactive Node รวมกัน **น้อยกว่า 2 ตัว** หรือเป็น Canvas/Game ให้ถ่ายภาพหน้าจอเป็น WebP (720p) ส่งมาในฟิลด์ `screenshot` เพื่อสลับไปใช้สายตา (Vision Mode)
+2. **Decide (ตัดสินใจผ่าน Strict Tool Calling)**:
+   * **Text Mode (ความเร็วสูง & ประหยัดต้นทุน)**: หากมี Interactive Node >= 2 ตัว ระบบจะแปลงโครงสร้างเป็น **One-line String format** และส่งให้ Groq (`gpt-oss-120b`) ตัดสินใจผ่าน Function Calling
+   * **Vision Mode (วิเคราะห์รูปภาพ)**: สลับไปใช้ OpenRouter (`Qwen3-VL`) พร้อมส่งภาพ Screenshot ไปคำนวณพิกัด
+   * **Validation Guard**: หากโมเดลคืนผลลัพธ์ไม่ตรง Tool Schema ระบบจะ Auto-Retry 1 ครั้งทันทีด้วย `temperature: 0.0`
 3. **Risk Check (ประเมินความเสี่ยง)**:
-   * **Risk Engine (`check_risk`)**: ตรวจสอบคำสั่งและเป้าหมายกับคีย์เวิร์ดที่มีความเสี่ยง (เช่น "ส่ง", "ลบ", "โอน", "ยืนยัน", "จ่าย", "ซื้อ", "pay", "delete", "buy", "confirm", "transfer")
+   * **Risk Engine (`check_risk`)**: ตรวจสอบคำสั่งและพารามิเตอร์กับคีย์เวิร์ดที่มีความเสี่ยง (เช่น "ส่ง", "ลบ", "โอน", "ยืนยัน", "จ่าย", "ซื้อ", "pay", "delete", "buy", "confirm", "transfer")
    * หากเข้าข่ายเสี่ยง และผู้ใช้ตั้งค่า `confirmation_mode !== 'none'`: ระบบจะหยุดรอ (Pause) และส่ง event `risk_confirmation_required` เพื่อรอให้ผู้ใช้อนุมัติ
-4. **Act (ส่งคำสั่งปฏิบัติการ)**:
-   * ส่งกรอบคำสั่ง `action` และข้อความความคืบหน้า `log` ให้ Android Client ดำเนินการกด, แตะ, พิมพ์ หรือเลื่อนหน้าจอ
+4. **Act (ส่งคำสั่งปฏิบัติการ 7 Tools)**:
+   * ส่ง Event `action` ระบุชื่อ Tool และพารามิเตอร์แบบ Typed ส่งตรงให้ Android ดำเนินการ
 5. **Verify (ตรวจสอบผลลัพธ์)**:
    * เมื่อ Android ทำงานเสร็จ จะส่ง `action_done` พร้อมโครงสร้างหน้าจอใหม่กลับมา
-   * **Structural Diff Engine (`verify_step`)**: เปรียบเทียบความแตกต่างเชิงโครงสร้าง DOM/Node ระหว่างก่อนและหลังทำ action เพื่อคำนวณ `verified_changed` (0 หรือ 1)
-   * บันทึกข้อมูลแต่ละขั้นตอนลงตาราง `task_steps` ใน D1 อย่างเป็นอิสระ (Atomic Persistence)
+   * บันทึกข้อมูลแต่ละขั้นตอนลงตาราง `task_steps` ใน D1
 
 ---
 
-### 4.2 เงื่อนไขการสิ้นสุดการทำงานอัตโนมัติ (Termination Conditions)
+### 4.2 สัญญาข้อมูล 8 Tools มาตรฐาน (API Contract)
 
-1. **Goal Completion (`finished`)**:
-   * เมื่อ AI บรรลุเป้าหมายคำสั่งของผู้ใช้ (`is_completed: true` หรือ `action_type: 'complete'`)
-   * ระบบอัปเดตตาราง `sessions.status = 'completed'` ใน D1 และส่ง event `finished` พร้อมปิดการเชื่อมต่อด้วย Code 1000
-2. **Loop Detection (`stopped_loop`)**:
-   * หากหน้าจอไม่มีการเปลี่ยนแปลงติดต่อกัน 3 ครั้ง (`verified_changed === 0` ต่อเนื่อง 3 steps)
-   * ระบบจะตัดวงจรหยุดการทำงานอัตโนมัติ อัปเดต `sessions.status = 'stopped_loop'` ใน D1 และส่ง event `stopped_loop` เพื่อป้องกันการติดลูปไม่รู้จบ
-3. **Step Limit Enforcer (`stopped_limit`)**:
-   * หากจำนวนขั้นตอนถึงขีดจำกัดสูงสุดของผู้ใช้ (`step_count >= max_step_limit`, ค่าเริ่มต้น 20 ขั้นตอน)
-   * ระบบจะหยุดการทำงานอัตโนมัติ อัปเดต `sessions.status = 'stopped_limit'` ใน D1 และส่ง event `stopped_limit`
+โมเดล AI ถูกบังคับให้เลือก 1 ใน 8 Tools ต่อไปนี้ในแต่ละขั้นตอน ห้ามส่งข้อความอิสระ (Free-form text) ระหว่างภารกิจ:
+
+| ชื่อ Tool (Function Name) | พารามิเตอร์ที่จำเป็น (Schema) | วัตถุประสงค์และเงื่อนไขการทำงาน |
+| :--- | :--- | :--- |
+| `open_app` | `app_name: String`, `package_name: String (Optional)` | สั่งเปิดแอปพลิเคชันบนมือถือผ่าน Launch Intent เช่น LINE, YouTube, Shopee, Settings โดยตรงแทนการสไลด์หาไอคอน |
+| `click_element` | `element_id: Integer`, `target_description: String` | สั่งกดปุ่มหรือ View ตามรหัส ID จาก UI Tree (แม่นยำสูงสุด $O(1)$) |
+| `click_coordinate` | `x: Int`, `y: Int`, `target_description: String` | สั่งแตะพิกัดหน้าจอโดยตรง ใช้เมื่อ UI Tree มองไม่เห็นโหนดหรือทำงานกับ Canvas |
+| `input_text` | `element_id: Int`, `text: String` | สั่งกรอกข้อความลงในช่อง EditText ผ่าน Set Text Argument |
+| `swipe_screen` | `direction: Enum ["UP", "DOWN", "LEFT", "RIGHT"]` | สั่งปัดหรือเลื่อนหน้าจอตามทิศทางเพื่อค้นหาเนื้อหาที่อยู่นอกจอ |
+| `system_navigation` | `action: Enum ["BACK", "HOME", "RECENTS"]` | สั่งกดปุ่มควบคุมระบบปฏิบัติการ เช่น กดย้อนกลับ หรือกลับหน้าโฮม |
+| `wait_and_poll` | `duration_ms: Integer` (500 - 3000) | สั่งหยุดรอให้หน้าจอโหลดข้อมูลหรือรอแอนิเมชันเสร็จสิ้น |
+| `task_finish` | `status: Enum ["success", "failed"]`, `message: String` | แจ้งสิ้นสุดภารกิจ พร้อมข้อความสรุปผลลัพธ์ภาษาไทยแจ้งผู้ใช้ |
 
 ---
 
@@ -572,35 +576,35 @@ val webSocket = client.newWebSocket(request, object : WebSocketListener() {
 
 #### 1. Android -> Backend: Event `observe` (ส่งสถานะหน้าจอเริ่มต้นหรือขั้นตอนใหม่)
 
-ส่งเมื่อเริ่มต้น Session หรือเมื่อต้องการให้ Agent วิเคราะห์หน้าจอ:
-
 ```json
 {
   "event": "observe",
-  "screen_tree": {
-    "class": "android.widget.FrameLayout",
-    "children": [
-      {
-        "id": "com.linecorp.line:id/chat_search",
-        "class": "android.widget.EditText",
-        "text": "ค้นหาชื่อเพื่อน",
-        "clickable": true
-      },
-      {
-        "id": "com.linecorp.line:id/btn_send",
-        "class": "android.widget.Button",
-        "text": "ส่งข้อความ",
-        "clickable": true
-      }
-    ]
-  },
-  "screenshot": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA..."
+  "screen_elements": [
+    {
+      "id": 0,
+      "class": "EditText",
+      "text": "ค้นหาเพื่อน",
+      "clickable": true,
+      "editable": true
+    },
+    {
+      "id": 1,
+      "class": "Button",
+      "text": "ส่งข้อความ",
+      "clickable": true
+    }
+  ],
+  "screenshot": null
 }
 ```
+*(กรณีที่หน้าจอมี Interactive Element < 2 ตัว ให้ส่งภาพ WebP Base64 แนบมาในฟิลด์ `"screenshot"`)*
 
-#### 2. Backend -> Android: Event `action` (คำสั่งที่ให้ Android นำไปปฏิบัติการ)
+> [!TIP]
+> **รูปแบบชื่อ Class (`class`)**:
+> - **แนะนำให้ใช้ชื่อสั้น (Short Name)**: เช่น `"Button"`, `"EditText"`, `"TextView"` (ตัด Package Name ด้วย `node.className?.toString()?.substringAfterLast('.') ?: "View"`) เพื่อประหยัดขนาด Payload ของ WebSocket บนเครือข่ายมือถือได้กว่า 30-50%
+> - **รองรับชื่อเต็ม (Full Name)**: หากฝั่ง Android ส่งชื่อเต็ม เช่น `"android.widget.Button"` หรือ `"androidx.appcompat.widget.AppCompatEditText"` ทาง Backend มีตัวแปลง `.split('.').pop()` รองรับโดยอัตโนมัติเช่นกัน
 
-ส่งเมื่อ Agent ตัดสินใจเลือกขั้นตอนถัดไปเรียบร้อยแล้ว:
+#### 2. Backend -> Android: Event `action` (คำสั่งให้ Android นำไปปฏิบัติการ)
 
 ```json
 {
@@ -608,26 +612,23 @@ val webSocket = client.newWebSocket(request, object : WebSocketListener() {
   "session_id": "3c983582-7d2d-4874-9457-3a1391df24bc",
   "step_no": 1,
   "step_id": "d1a6b0c2-5e4f-4d32-9c12-87a419ef89ab",
+  "tool": "click_element",
+  "tool_name": "click_element",
+  "parameters": {
+    "element_id": 1,
+    "target_description": "ปุ่มส่งข้อความ"
+  },
   "action": {
-    "action_type": "tap",
+    "action_type": "click_element",
     "target": "ปุ่มส่งข้อความ",
-    "target_id": "com.linecorp.line:id/btn_send",
-    "coordinates": null,
-    "text": null,
-    "log_message": "กำลังกดปุ่มส่งข้อความ",
+    "element_id": 1,
+    "log_message": "กดปุ่มหรือโหนด ID [1] (ปุ่มส่งข้อความ)",
     "is_completed": false
   },
   "mode_used": "text",
   "is_risky": false
 }
 ```
-
-*ประเภทของ `action_type`*:
-* `"tap"`: สั่งคลิก/แตะที่องค์ประกอบเป้าหมายตาม `target_id` หรือ `coordinates: { "x": 0.5, "y": 0.5 }`
-* `"type_text"`: สั่งพิมพ์ข้อความที่ระบุในฟิลด์ `text`
-* `"scroll_down"` / `"scroll_up"`: สั่งเลื่อนหน้าจอลงหรือขึ้น
-* `"back"` / `"home"`: สั่งกดปุ่ม Back หรือ Home
-* `"complete"`: งานเสร็จสิ้นแล้ว
 
 #### 3. Android -> Backend: Event `action_done` (รายงานผลการกระทำ)
 
@@ -638,18 +639,22 @@ val webSocket = client.newWebSocket(request, object : WebSocketListener() {
   "event": "action_done",
   "step_no": 1,
   "status": "ok",
-  "screen_tree": {
-    "class": "android.widget.FrameLayout",
-    "children": [
-      {
-        "class": "android.widget.TextView",
-        "text": "ส่งข้อความเรียบร้อยแล้ว"
-      }
-    ]
-  },
+  "screen_elements": [
+    {
+      "id": 0,
+      "class": "TextView",
+      "text": "ส่งข้อความเรียบร้อยแล้ว"
+    }
+  ],
   "screenshot": null
 }
 ```
+
+> [!IMPORTANT]
+> **กรณีคำสั่ง `task_finish` (สิ้นสุดภารกิจ)**:
+> เมื่อ Android ได้รับ `event: "action"` ที่มี `tool: "task_finish"` **ไม่ต้องส่ง `action_done` กลับมายัง Backend**!
+> * เนื่องจากภารกิจเสร็จสิ้นแล้ว Backend จะบันทึกสถานะลงฐานข้อมูล และส่ง `event: "finished"` ตามมาทันที พร้อมปิด WebSocket ด้วย Code 1000
+> * สิ่งที่แอปต้องทำคือ: แสดงข้อความสรุปผลลัพธ์ (Toast/TTS) จาก `parameters.message` และรอรับ `event: "finished"` เพื่ออัปเดต UI หน้าจอเป็นเสร็จสิ้นสมบูรณ์
 
 #### 4. Backend -> Android: Event `risk_confirmation_required` (ขออนุมัติการกระทำความเสี่ยง)
 
@@ -662,9 +667,13 @@ val webSocket = client.newWebSocket(request, object : WebSocketListener() {
   "step_no": 2,
   "step_id": "89b7fa12-e304-44ac-9701-d7a8c32bc611",
   "action": {
-    "action_type": "tap",
+    "action_type": "click_element",
+    "tool_name": "click_element",
+    "parameters": {
+      "element_id": 3,
+      "target_description": "ปุ่ม ยืนยันการโอนเงิน"
+    },
     "target": "ปุ่ม ยืนยันการโอนเงิน",
-    "target_id": "btn_confirm_transfer",
     "log_message": "กดปุ่มยืนยันการโอนเงิน",
     "is_completed": false
   },
@@ -674,135 +683,214 @@ val webSocket = client.newWebSocket(request, object : WebSocketListener() {
 }
 ```
 
-*คำแนะนำ Android*:
-* แสดง Native AlertDialog หรือ BottomSheet แจ้งเตือนผู้ใช้ทันที
-* แสดงชื่อเป้าหมาย (`target`) และเหตุผลความเสี่ยง
-* เมื่อผู้ใช้กดปุ่ม:
-  * หาก **"อนุมัติ"**: ส่ง `{"event": "confirm", "approved": true}` ผ่าน WebSocket หรือยิง `POST /api/tasks/{session_id}/confirm` ด้วย body `{"approved": true}`
-  * หาก **"ปฏิเสธ"**: ส่ง `{"event": "confirm", "approved": false}` ระบบจะยกเลิกงานทันที
+*เมื่อผู้ใช้กดปุ่ม*:
+* **อนุมัติ**: ส่ง `{"event": "confirm", "approved": true}` ผ่าน WebSocket หรือยิง `POST /api/tasks/{session_id}/confirm` ด้วย body `{"approved": true}`
+* **ปฏิเสธ**: ส่ง `{"event": "confirm", "approved": false}` ระบบจะยกเลิกงานทันที
 
-#### 5. Android -> Backend: Event `confirm` (ส่งผลการอนุมัติความเสี่ยง)
+#### 5. Backend -> Android: Event `finished` (งานเสร็จสมบูรณ์)
 
 ```json
 {
-  "event": "confirm",
-  "approved": true
-}
-```
-
-#### 6. Backend -> Android: Event `stopped_loop` (หยุดทำงานเนื่องจากตรวจพบลูป)
-
-```json
-{
-  "event": "stopped_loop",
+  "event": "finished",
   "session_id": "3c983582-7d2d-4874-9457-3a1391df24bc",
-  "status": "stopped_loop",
-  "total_steps": 3,
-  "step_count": 3,
-  "summary_message": "ตรวจพบลูปการทำงานซ้ำซ้อน 3 ครั้งโดยหน้าจอไม่เปลี่ยนแปลง ระบบหยุดการทำงานโดยอัตโนมัติ"
-}
-```
-
-#### 7. Backend -> Android: Event `stopped_limit` (หยุดทำงานเนื่องจากเกินลิมิตขั้นตอน)
-
-```json
-{
-  "event": "stopped_limit",
-  "session_id": "3c983582-7d2d-4874-9457-3a1391df24bc",
-  "status": "stopped_limit",
-  "total_steps": 20,
-  "step_count": 20,
-  "summary_message": "จำนวนขั้นตอนถึงขีดจำกัดสูงสุด (20 ขั้นตอน) ระบบหยุดการทำงานอัตโนมัติ"
+  "status": "completed",
+  "total_steps": 5,
+  "step_count": 5,
+  "summary_message": "โอนเงินและส่งสลิปให้เพื่อนเรียบร้อยแล้ว"
 }
 ```
 
 ---
 
-### 4.4 ตัวอย่างโค้ด Android Kotlin สำหรับการเชื่อมต่อ Epic 3 Agent Loop
+### 4.4 แนวทางการปฏิบัติจริงสำหรับ Frontend / Android Developer (Tool Execution & open_app)
+
+#### 1. การตั้งค่า `AndroidManifest.xml` (จำเป็นสำหรับ Android 11+ / API 30+)
+เนื่องจาก Android 11 ขึ้นไปมีระบบจำกัดการมองเห็นแพ็กเกจ (Package Visibility Restrictions) เพื่อให้แอป Hollis สามารถตรวจสอบและสั่งเปิดแอปพลิเคชันอื่นบนเครื่องได้ จำเป็นต้องประกาศแท็ก `<queries>` ใน `AndroidManifest.xml`:
+
+```xml
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- อนุญาตให้ Hollis มองเห็นและสั่งเปิดแอปพลิเคชัน Launcher ทุกตัวในเครื่อง -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <application ...>
+        <!-- Service & Activities -->
+    </application>
+</manifest>
+```
+
+---
+
+#### 2. ตัวอย่างโค้ด Kotlin สำหรับ Accessibility Service (8 Tools Handler)
 
 ```kotlin
-// 1. เชื่อมต่อ WebSocket ในโหมด Interactive
-val wsUrl = "wss://hollis-backend.integrated-hollis.workers.dev/ws/tasks/$sessionId?token=$token&mode=interactive"
-val request = Request.Builder().url(wsUrl).build()
+class HollisAccessibilityService : AccessibilityService() {
 
-val webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
-    override fun onOpen(webSocket: WebSocket, response: Response) {
-        // เมื่อเชื่อมต่อสำเร็จ ส่ง observe แรกของหน้าจอปัจจุบัน
-        val screenTreeJson = accessibilityService.captureScreenTreeAsJson()
-        val observePayload = JSONObject().apply {
-            put("event", "observe")
-            put("screen_tree", screenTreeJson)
+    // 1. In-Memory Mapping Cache: เก็บความสัมพันธ์ id: Int -> WeakReference<AccessibilityNodeInfo>
+    private val elementCache = mutableMapOf<Int, WeakReference<AccessibilityNodeInfo>>()
+
+    // ฟังก์ชัน Prune Node และสร้าง ID แบบลำดับ (0, 1, 2, ...)
+    fun pruneAndCacheScreen(): JSONArray {
+        elementCache.clear()
+        val elementsArray = JSONArray()
+        var currentId = 0
+
+        fun traverse(node: AccessibilityNodeInfo?) {
+            if (node == null || !node.isVisibleToUser) return
+
+            val isInteractive = node.isClickable || node.isEditable || node.isCheckable
+            val text = (node.text ?: node.contentDescription ?: "").toString().trim()
+
+            if (isInteractive || text.isNotEmpty()) {
+                val elementId = currentId++
+                elementCache[elementId] = WeakReference(node)
+
+                val item = JSONObject().apply {
+                    put("id", elementId)
+                    put("class", node.className?.toString()?.substringAfterLast('.') ?: "View")
+                    put("text", text)
+                    put("clickable", node.isClickable)
+                    put("editable", node.isEditable)
+                    put("checkable", node.isCheckable)
+                }
+                elementsArray.put(item)
+            }
+
+            for (i in 0 until node.childCount) {
+                traverse(node.getChild(i))
+            }
         }
-        webSocket.send(observePayload.toString())
+
+        traverse(rootInActiveWindow)
+        return elementsArray
     }
 
-    override fun onMessage(webSocket: WebSocket, text: String) {
-        val json = JSONObject(text)
-        when (json.optString("event")) {
-            "action" -> {
-                val stepNo = json.optInt("step_no")
-                val actionObj = json.getJSONObject("action")
-                val actionType = actionObj.optString("action_type")
-                
-                // สั่งให้ Accessibility Service ดำเนินการบนหน้าจอจริง
-                accessibilityService.executeAction(actionObj) { success ->
-                    // เมื่อทำเสร็จ จับหน้าจอใหม่ส่ง action_done กลับไป
-                    val updatedTree = accessibilityService.captureScreenTreeAsJson()
-                    val donePayload = JSONObject().apply {
-                        put("event", "action_done")
-                        put("step_no", stepNo)
-                        put("status", if (success) "ok" else "error")
-                        put("screen_tree", updatedTree)
+    // ฟังก์ชันแปลงชื่อแอปเป็น Package Name (มี Built-in Mapping ยอดนิยม + Dynamic Lookup)
+    private fun resolvePackageName(appName: String): String? {
+        val commonApps = mapOf(
+            "line" to "jp.naver.line.android",
+            "youtube" to "com.google.android.youtube",
+            "facebook" to "com.facebook.katana",
+            "chrome" to "com.android.chrome",
+            "settings" to "com.android.settings",
+            "ตั้งค่า" to "com.android.settings",
+            "shopee" to "com.shopee.th",
+            "lazada" to "com.lazada.android",
+            "tiktok" to "com.zhiliaoapp.musically",
+            "gmail" to "com.google.android.gm",
+            "maps" to "com.google.android.apps.maps",
+            "แผนที่" to "com.google.android.apps.maps"
+        )
+        val normalized = appName.trim().lowercase()
+        commonApps[normalized]?.let { return it }
+
+        // Dynamic search through installed launcher applications
+        val pm = applicationContext.packageManager
+        val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+            addCategory(Intent.CATEGORY_LAUNCHER)
+        }
+        val resolveList = pm.queryIntentActivities(mainIntent, 0)
+        for (info in resolveList) {
+            val label = info.loadLabel(pm).toString().lowercase()
+            if (label.contains(normalized)) {
+                return info.activityInfo.packageName
+            }
+        }
+        return null
+    }
+
+    // 2. การประมวลผลคำสั่ง 8 Tools ที่ได้รับจาก Backend
+    fun executeToolAction(toolName: String, params: JSONObject, onDone: (Boolean) -> Unit) {
+        when (toolName) {
+            "open_app" -> {
+                val appName = params.getString("app_name")
+                val explicitPkg = params.optString("package_name").takeIf { it.isNotEmpty() }
+                val targetPkg = explicitPkg ?: resolvePackageName(appName)
+
+                if (targetPkg != null) {
+                    val launchIntent = packageManager.getLaunchIntentForPackage(targetPkg)
+                    if (launchIntent != null) {
+                        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        startActivity(launchIntent)
+                        // ให้เวลาระบบ Android สลับหน้าต่างและโหลด UI ของแอปใหม่ (~1200ms) ก่อนส่ง action_done
+                        Handler(Looper.getMainLooper()).postDelayed({
+                            onDone(true)
+                        }, 1200L)
+                    } else {
+                        Toast.makeText(applicationContext, "ไม่สามารถเปิดแอป: $appName ได้", Toast.LENGTH_SHORT).show()
+                        onDone(false)
                     }
-                    webSocket.send(donePayload.toString())
+                } else {
+                    Toast.makeText(applicationContext, "ไม่พบแอป: $appName บนเครื่องนี้", Toast.LENGTH_SHORT).show()
+                    onDone(false)
                 }
             }
 
-            "risk_confirmation_required" -> {
-                val keyword = json.optString("matched_keyword")
-                val msg = json.optString("message")
-                
-                // แสดง Popup Dialog บนหน้าจอผู้ใช้
-                runOnUiThread {
-                    AlertDialog.Builder(context)
-                        .setTitle("⚠️ ยืนยันการกระทำที่มีความเสี่ยง")
-                        .setMessage(msg)
-                        .setPositiveButton("อนุญาต") { _, _ ->
-                            webSocket.send(JSONObject().apply {
-                                put("event", "confirm")
-                                put("approved", true)
-                            }.toString())
-                        }
-                        .setNegativeButton("ยกเลิก") { _, _ ->
-                            webSocket.send(JSONObject().apply {
-                                put("event", "confirm")
-                                put("approved", false)
-                            }.toString())
-                        }
-                        .setCancelable(false)
-                        .show()
+            "click_element" -> {
+                val elementId = params.getInt("element_id")
+                val nodeRef = elementCache[elementId]?.get()
+                if (nodeRef != null && nodeRef.refresh()) {
+                    val success = nodeRef.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    onDone(success)
+                } else {
+                    onDone(false) // Fallback ไปใช้ click_coordinate หากโหนดหลุด
                 }
             }
 
-            "stopped_loop" -> {
-                runOnUiThread {
-                    Toast.makeText(context, "ระบบหยุดการทำงาน: ตรวจพบลูปซ้ำซ้อน", Toast.LENGTH_LONG).show()
+            "input_text" -> {
+                val elementId = params.getInt("element_id")
+                val text = params.getString("text")
+                val nodeRef = elementCache[elementId]?.get()
+                if (nodeRef != null && nodeRef.refresh()) {
+                    val arguments = Bundle().apply {
+                        putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+                    }
+                    val success = nodeRef.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
+                    onDone(success)
+                } else {
+                    onDone(false)
                 }
             }
 
-            "stopped_limit" -> {
-                runOnUiThread {
-                    Toast.makeText(context, "ระบบหยุดการทำงาน: เกินจำนวนขั้นตอนที่กำหนด", Toast.LENGTH_LONG).show()
-                }
+            "click_coordinate" -> {
+                val x = params.getInt("x").toFloat()
+                val y = params.getInt("y").toFloat()
+                dispatchSingleTapGesture(x, y) { success -> onDone(success) }
             }
 
-            "finished" -> {
-                runOnUiThread {
-                    Toast.makeText(context, "งานสำเร็จเรียบร้อยแล้ว!", Toast.LENGTH_SHORT).show()
+            "swipe_screen" -> {
+                val direction = params.getString("direction")
+                dispatchDirectionalSwipe(direction) { success -> onDone(success) }
+            }
+
+            "system_navigation" -> {
+                val action = params.getString("action")
+                val globalAction = when (action) {
+                    "BACK" -> GLOBAL_ACTION_BACK
+                    "HOME" -> GLOBAL_ACTION_HOME
+                    "RECENTS" -> GLOBAL_ACTION_RECENTS
+                    else -> GLOBAL_ACTION_BACK
                 }
+                val success = performGlobalAction(globalAction)
+                onDone(success)
+            }
+
+            "wait_and_poll" -> {
+                val durationMs = params.optLong("duration_ms", 1000L)
+                Handler(Looper.getMainLooper()).postDelayed({ onDone(true) }, durationMs)
+            }
+
+            "task_finish" -> {
+                val msg = params.optString("message", "ภารกิจเสร็จสมบูรณ์")
+                Toast.makeText(applicationContext, msg, Toast.LENGTH_LONG).show()
+                // จบภารกิจ: ไม่ต้องส่ง action_done กลับไปยัง Backend (ให้รอรับ event: "finished" เพื่ออัปเดตหน้าจอและปิด Socket)
             }
         }
     }
-})
+}
 ```
 

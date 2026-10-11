@@ -8,7 +8,15 @@
 import { SYSTEM_PROMPT, buildUserPrompt } from './prompt.js';
 
 const GROQ_COMPLETIONS_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const DEFAULT_MODEL = 'gpt-oss-120b';
+// Groq's id carries the vendor prefix; the bare "gpt-oss-120b" is answered with HTTP 404 model_not_found.
+const DEFAULT_MODEL = 'openai/gpt-oss-120b';
+
+/** Accepts the bare gpt-oss names (an easy slip in GROQ_MODEL) and returns the id Groq expects. */
+export function resolveGroqModel(model) {
+  const name = (model || '').trim();
+  if (!name) return DEFAULT_MODEL;
+  return /^gpt-oss-/i.test(name) ? `openai/${name}` : name;
+}
 
 /**
  * 7 Standard Tools Schema per Specification Document.
@@ -346,7 +354,7 @@ async function executeGroqRequest({ apiKey, model, messages, temperature = 0.1, 
  * @param {string} params.instruction - User command
  * @param {any} [params.screen_tree] - Screen accessibility elements
  * @param {Array} [params.history] - Array of previous steps
- * @param {string} [params.model] - Model identifier (default: gpt-oss-120b)
+ * @param {string} [params.model] - Model identifier (default: openai/gpt-oss-120b)
  * @param {number} [params.timeoutMs=15000] - Request timeout in ms
  * @returns {Promise<object>} Normalized Action Object
  */
@@ -364,6 +372,7 @@ export async function callGroqTextModel({
   if (!apiKey) {
     throw new Error('Groq API Key is required.');
   }
+  model = resolveGroqModel(model);
 
   const userContent = buildUserPrompt({
     instruction,

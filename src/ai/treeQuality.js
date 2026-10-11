@@ -1,7 +1,7 @@
 /**
  * Screen Tree Quality Evaluator for Hollis Backend.
  * Analyzes Android Accessibility Node Tree hierarchy to choose between
- * Text Mode (Groq / gpt-oss-120b) and Vision Mode (OpenRouter / Qwen3-VL).
+ * Text Mode (Groq / openai/gpt-oss-120b) and Vision Mode (OpenRouter / Qwen3-VL).
  */
 
 /**
@@ -183,7 +183,7 @@ export function checkTreeQuality(screenTree) {
     total_nodes: stats.totalNodes,
     maxDepth: stats.maxDepth,
     depth: stats.maxDepth,
-    reason: `Sufficient tree hierarchy found (${stats.interactiveNodes} interactive, ${stats.textNodes} text nodes). Using Text Mode (Groq / gpt-oss-120b).`,
+    reason: `Sufficient tree hierarchy found (${stats.interactiveNodes} interactive, ${stats.textNodes} text nodes). Using Text Mode (Groq / openai/gpt-oss-120b).`,
   };
 }
 

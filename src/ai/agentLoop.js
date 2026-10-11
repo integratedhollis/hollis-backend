@@ -357,6 +357,8 @@ export class AgentLoop {
       status: 'failed',
       code,
       message,
+      // The provider's own error text (e.g. "HTTP 404 model_not_found"), so a misconfiguration is diagnosable from the phone's log.
+      detail: err instanceof AIEngineError && err.details?.length ? String(err.details[0]).slice(0, 300) : undefined,
       summary_message: message,
       total_steps: this.currentStep,
       step_count: this.currentStep,

@@ -7,7 +7,7 @@ JWT_SECRET=your-secret-key-here-for-local-development
 # Production: npx wrangler secret put GROQ_API_KEY   (and OPENROUTER_API_KEY for vision fallback)
 GROQ_API_KEY=
 OPENROUTER_API_KEY=
-# Optional overrides: GROQ_MODEL (default gpt-oss-120b), GROQ_REASONING_EFFORT (low|medium|high),
+# Optional overrides: GROQ_MODEL (default openai/gpt-oss-120b), GROQ_REASONING_EFFORT (low|medium|high),
 # OPENROUTER_MODEL (default qwen/qwen-2.5-vl-72b-instruct)
 
 # Tests / offline development ONLY: lets the scripted mock engine answer when no key is set.

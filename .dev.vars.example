@@ -1,2 +1,4 @@
 # Environment secrets for local development with wrangler dev
+# JWT_SECRET is REQUIRED (no built-in fallback). Use a long random value, e.g. `openssl rand -hex 32`.
+# In production set it with: npx wrangler secret put JWT_SECRET
 JWT_SECRET=your-secret-key-here-for-local-development

@@ -34,6 +34,18 @@ function abortableSleep(ms, signal) {
   });
 }
 
+/**
+ * Pulls the screen out of an `observe` / `action_done` frame.
+ * The Android client (and API docs) send a flat `screen_elements` array; `screen_tree` is the
+ * older nested form. Accept both so the model never sees an empty screen.
+ * @param {object} data
+ * @returns {any}
+ */
+function extractScreen(data) {
+  if (!data || typeof data !== 'object') return null;
+  return data.screen_tree ?? data.screen_elements ?? null;
+}
+
 export class AgentLoop {
   /**
    * @param {object} params
@@ -75,8 +87,11 @@ export class AgentLoop {
     this.latestObservation = null;
 
     this.pendingConfirmResolver = null;
+    this.pendingConfirmStepId = null;
+    this.pendingActionResolver = null;
     this.loopRunning = false;
     this.isSuperseded = false;
+    this.remoteSyncStarted = false;
 
     // Attach abort signal listener to cleanly close socket from within its own execution context
     this.abortController?.signal?.addEventListener(
@@ -153,8 +168,9 @@ export class AgentLoop {
    */
   async handleObserve(data) {
     this.isInteractive = true;
+    const screenTree = extractScreen(data);
     this.latestObservation = {
-      screen_tree: data.screen_tree || null,
+      screen_tree: screenTree,
       screenshot: data.screenshot || null,
     };
 
@@ -163,7 +179,7 @@ export class AgentLoop {
       const resolver = this.pendingActionResolver;
       this.pendingActionResolver = null;
       resolver({
-        screen_tree: data.screen_tree || null,
+        screen_tree: screenTree,
         screenshot: data.screenshot || null,
         status: 'ok',
       });
@@ -197,6 +213,66 @@ export class AgentLoop {
       this.pendingConfirmResolver = null;
       resolver(Boolean(data.approved));
     }
+  }
+
+  /**
+   * Keeps this loop in sync with REST calls handled by a *different* Worker isolate.
+   *
+   * POST /cancel and POST /confirm only reach this loop directly (via wsRegistry) when they
+   * land on the same isolate that holds the WebSocket. Both endpoints always write to D1 first,
+   * so this watcher polls D1 while the connection is alive and applies:
+   * - an external cancellation (sessions.status = 'cancelled')
+   * - an external risk confirmation answer (risk_confirmations.user_response) while one is pending
+   * Same-isolate behaviour is unchanged; this is only a fallback.
+   *
+   * @param {number} [intervalMs=2000]
+   */
+  startRemoteSync(intervalMs = 2000) {
+    if (this.remoteSyncStarted) return;
+    this.remoteSyncStarted = true;
+
+    const tick = async () => {
+      if (this.abortController.signal.aborted || this.isSuperseded || this.status !== 'running') {
+        return;
+      }
+
+      try {
+        // 1. External risk-confirmation answer
+        if (this.pendingConfirmResolver && this.pendingConfirmStepId) {
+          const row = await this.env.DB.prepare(
+            `SELECT user_response FROM risk_confirmations WHERE step_id = ?`
+          )
+            .bind(this.pendingConfirmStepId)
+            .first();
+          if (row && row.user_response && this.pendingConfirmResolver) {
+            this.handleConfirm({ approved: row.user_response === 'approved' });
+          }
+        }
+
+        // 2. External cancellation
+        const session = await this.env.DB.prepare(
+          `SELECT status FROM sessions WHERE id = ? AND user_id = ?`
+        )
+          .bind(this.sessionId, this.userId)
+          .first();
+        if (
+          session &&
+          session.status === 'cancelled' &&
+          this.status === 'running' &&
+          !this.isSuperseded
+        ) {
+          this.handleAbortOrCancellation();
+          this.abortController.abort();
+          return;
+        }
+      } catch (err) {
+        console.warn(`[AgentLoop ${this.sessionId}] Remote sync poll failed:`, err.message);
+      }
+
+      setTimeout(tick, intervalMs);
+    };
+
+    setTimeout(tick, intervalMs);
   }
 
   /**
@@ -335,6 +411,7 @@ export class AgentLoop {
           });
 
           // Await confirmation (with 60s timeout)
+          this.pendingConfirmStepId = stepId;
           const approved = await new Promise((resolve) => {
             const timeout = setTimeout(() => {
               if (this.pendingConfirmResolver) {
@@ -348,6 +425,7 @@ export class AgentLoop {
               resolve(result);
             };
           });
+          this.pendingConfirmStepId = null;
 
           if (this.abortController.signal.aborted) {
             this.handleAbortOrCancellation();
@@ -481,7 +559,7 @@ export class AgentLoop {
 
           if (actionDoneData) {
             stateAfter = {
-              screen_tree: actionDoneData.screen_tree || null,
+              screen_tree: extractScreen(actionDoneData),
               screenshot: actionDoneData.screenshot || null,
             };
           }

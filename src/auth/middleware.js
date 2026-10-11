@@ -9,7 +9,18 @@ import { verifyJwt } from './jwt.js';
 import { verifyFirebaseIdToken } from './firebase.js';
 import { errorResponse } from '../utils/response.js';
 
-export const DEFAULT_JWT_SECRET = 'hollis-default-dev-secret-key-do-not-use-in-prod-32bytes';
+/**
+ * Returns the configured HS256 signing secret, or null if JWT_SECRET is not set.
+ * There is deliberately no built-in fallback: a secret hard-coded in source would let
+ * anyone forge access tokens. Set it with `wrangler secret put JWT_SECRET` (or .dev.vars locally).
+ *
+ * @param {Record<string, any>} [env]
+ * @returns {string | null}
+ */
+export function getJwtSecret(env) {
+  const secret = env && typeof env.JWT_SECRET === 'string' ? env.JWT_SECRET.trim() : '';
+  return secret.length > 0 ? secret : null;
+}
 
 /**
  * Just-in-Time (JIT) provisioning or retrieval of a Firebase user in D1.
@@ -96,7 +107,11 @@ export async function authenticateToken(token, env) {
 
   // 2. Fallback: Custom JWT verification (HS256)
   try {
-    const secret = (env && env.JWT_SECRET) || DEFAULT_JWT_SECRET;
+    const secret = getJwtSecret(env);
+    if (!secret) {
+      console.error('JWT_SECRET is not configured; custom JWT fallback is disabled.');
+      return null;
+    }
     const jwtResult = await verifyJwt(trimmedToken, secret);
     if (jwtResult.valid && jwtResult.payload && jwtResult.payload.type === 'access') {
       return {

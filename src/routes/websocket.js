@@ -154,6 +154,9 @@ export async function handleWebSocketRoute(request, env, ctx, url) {
     agentLoop,
   });
 
+  // Poll D1 for cancel/confirm issued via REST on a different isolate
+  agentLoop.startRemoteSync();
+
   // 7. Send initial connected event
   server.send(
     JSON.stringify({

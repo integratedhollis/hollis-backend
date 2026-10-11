@@ -9,7 +9,7 @@
 
 import { hashPassword, verifyPassword } from '../auth/crypto.js';
 import { signJwt, verifyJwt } from '../auth/jwt.js';
-import { DEFAULT_JWT_SECRET, authenticateToken } from '../auth/middleware.js';
+import { getJwtSecret, authenticateToken } from '../auth/middleware.js';
 import { jsonResponse, errorResponse } from '../utils/response.js';
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -22,6 +22,13 @@ const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
  * @returns {Promise<Response>}
  */
 export async function handleRegister(request, env) {
+  // Fail before touching the DB so no account is created that cannot receive a token.
+  const secret = getJwtSecret(env);
+  if (!secret) {
+    console.error('JWT_SECRET is not configured; cannot register users.');
+    return errorResponse('Server authentication is not configured.', 500, 'server_misconfigured');
+  }
+
   let body;
   try {
     body = await request.json();
@@ -79,7 +86,6 @@ export async function handleRegister(request, env) {
     ).bind(settingsId, userId, 'popup', 20, now),
   ]);
 
-  const secret = env.JWT_SECRET || DEFAULT_JWT_SECRET;
   const accessToken = await signJwt(
     { sub: userId, username: normalizedUsername, email: normalizedEmail, type: 'access' },
     secret,
@@ -113,6 +119,12 @@ export async function handleRegister(request, env) {
  * @returns {Promise<Response>}
  */
 export async function handleLogin(request, env) {
+  const secret = getJwtSecret(env);
+  if (!secret) {
+    console.error('JWT_SECRET is not configured; cannot issue tokens.');
+    return errorResponse('Server authentication is not configured.', 500, 'server_misconfigured');
+  }
+
   let body;
   try {
     body = await request.json();
@@ -143,7 +155,6 @@ export async function handleLogin(request, env) {
     return errorResponse('Invalid email or password', 401, 'invalid_credentials');
   }
 
-  const secret = env.JWT_SECRET || DEFAULT_JWT_SECRET;
   const accessToken = await signJwt(
     { sub: user.id, username: user.username, email: user.email, type: 'access' },
     secret,

@@ -5,6 +5,8 @@
  * targeting gpt-oss-120b with strict 7-tool schema per Mobile Agent Specification.
  */
 
+import { SYSTEM_PROMPT, buildUserPrompt } from './prompt.js';
+
 const GROQ_COMPLETIONS_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const DEFAULT_MODEL = 'gpt-oss-120b';
 
@@ -31,7 +33,7 @@ export const HOLLIS_TOOLS = [
     type: 'function',
     function: {
       name: 'click_coordinate',
-      description: 'สั่งแตะพิกัดหน้าจอโดยตรง ใช้เมื่อ UI Tree มองไม่เห็น Node หรือทำงานกับ Canvas',
+      description: 'สั่งแตะพิกัดหน้าจอโดยตรง ใช้เมื่อ UI Tree มองไม่เห็น Node หรือทำงานกับ Canvas (x, y เป็นพิกเซลจริงของหน้าจอ ตามขนาดจอที่ระบุ)',
       parameters: {
         type: 'object',
         properties: {
@@ -62,11 +64,11 @@ export const HOLLIS_TOOLS = [
     type: 'function',
     function: {
       name: 'swipe_screen',
-      description: 'สั่งปัดหรือเลื่อนหน้าจอตามทิศทาง เพื่อค้นหาเนื้อหาหรือเมนูที่อยู่นอกจอ',
+      description: 'เลื่อนหน้าจอเพื่อดูเนื้อหาที่อยู่นอกจอ direction คือทิศทางของเนื้อหาที่ต้องการเห็น: DOWN = ดูเนื้อหาด้านล่างต่อ (เหมือนเลื่อนลง), UP = ย้อนกลับขึ้นด้านบน, LEFT/RIGHT = ดูเนื้อหาด้านซ้าย/ขวา',
       parameters: {
         type: 'object',
         properties: {
-          direction: { type: 'string', enum: ['UP', 'DOWN', 'LEFT', 'RIGHT'], description: 'ทิศทางการเลื่อน/ปัด' },
+          direction: { type: 'string', enum: ['UP', 'DOWN', 'LEFT', 'RIGHT'], description: 'ทิศทางของเนื้อหาที่ต้องการเห็น (DOWN = เห็นเนื้อหาด้านล่าง)' },
         },
         required: ['direction'],
       },
@@ -170,15 +172,23 @@ export function formatElementsToOneLine(screenTree, maxNodes = 60) {
       if (!el || typeof el !== 'object') continue;
       const id = el.id !== undefined ? el.id : i;
       const type = (el.class || el.type || 'View').split('.').pop();
-      const text = (el.text || el.content_description || el.label || el.hint || '').trim();
+      const text = String(el.text || el.content_description || el.label || '').trim();
+      const desc = String(el.desc || '').trim();
+      const hint = String(el.hint || '').trim();
       const traits = [];
       if (el.clickable || el.is_clickable) traits.push('clickable');
       if (el.editable || el.is_editable || type.toLowerCase().includes('edittext')) traits.push('editable');
       if (el.checkable || el.is_checkable) traits.push('checkable');
+      if (el.checked) traits.push('checked');
+      if (el.scrollable) traits.push('scrollable');
+      if (el.selected) traits.push('selected');
+      if (el.enabled === false) traits.push('disabled');
 
       const traitStr = traits.length > 0 ? ` (${traits.join(', ')})` : '';
       const textStr = text ? ` "${text}"` : '';
-      lines.push(`[${id}] ${type}${textStr}${traitStr}`);
+      const descStr = desc && desc !== text ? ` {${desc}}` : '';
+      const hintStr = hint && hint !== text ? ` <${hint}>` : '';
+      lines.push(`[${id}] ${type}${textStr}${descStr}${hintStr}${traitStr}`);
     }
     return lines.length > 0 ? lines.join('\n') : 'Empty element tree';
   }
@@ -294,7 +304,7 @@ export function normalizeToolAction(toolName, args, rawResponse = null) {
 /**
  * Executes a single completion request to Groq API with Tool Calling.
  */
-async function executeGroqRequest({ apiKey, model, messages, temperature = 0.1, timeoutMs = 15000 }) {
+async function executeGroqRequest({ apiKey, model, messages, temperature = 0.1, timeoutMs = 15000, reasoningEffort = null }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -311,6 +321,8 @@ async function executeGroqRequest({ apiKey, model, messages, temperature = 0.1, 
         tools: HOLLIS_TOOLS,
         tool_choice: 'required',
         temperature,
+        // gpt-oss only: bounds how long the model thinks before answering.
+        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
       }),
       signal: controller.signal,
     });
@@ -343,39 +355,29 @@ export async function callGroqTextModel({
   instruction,
   screen_tree,
   history = [],
+  context = {},
+  feedback = null,
   model = DEFAULT_MODEL,
+  reasoningEffort = 'medium',
   timeoutMs = 15000,
 }) {
   if (!apiKey) {
     throw new Error('Groq API Key is required.');
   }
 
-  const systemPrompt = `You are Hollis, an autonomous Android UI screen automation agent.
-Your task is to examine the user goal and the current screen UI elements, then select the NEXT single atomic tool call.
+  const userContent = buildUserPrompt({
+    instruction,
+    screenText: formatElementsToOneLine(screen_tree),
+    history,
+    context,
+    feedback,
+  });
 
-RULES:
-1. You MUST call exactly one tool from the provided tools definition. Do not output free-form text.
-2. If the user's overall goal is already fully achieved on screen, call "task_finish" with status "success" and a polite Thai message.
-3. To interact with a UI element, inspect the element ID and call "click_element" or "input_text".
-4. If an element cannot be clicked directly, or for scrolling, use "swipe_screen" or "click_coordinate".
-5. For OS navigation buttons, use "system_navigation" (BACK, HOME, RECENTS).
-6. To wait for loading or animations, use "wait_and_poll".
-7. To launch an installed application directly (e.g. LINE, YouTube, Chrome, Settings), use "open_app" with the app_name (and optional package_name) instead of swiping home screens.`;
-
-  const formattedTree = formatElementsToOneLine(screen_tree);
-  const historySummary = history.length > 0
-    ? `\nPrevious actions taken:\n` + history.map((h, i) => `Step ${i + 1}: ${h.action?.tool_name || h.action?.action_type || h.action_type} - ${h.action?.log_message || h.log_message}`).join('\n')
-    : '';
-
-  const userContent = `User Goal: "${instruction}"
-${historySummary}
-Current Screen Elements (One-line format):
-${formattedTree}
-
-Select the next tool call.`;
+  // Only gpt-oss models accept reasoning_effort; other models would reject the request.
+  const effort = /gpt-oss/i.test(model) ? reasoningEffort : null;
 
   const messages = [
-    { role: 'system', content: systemPrompt },
+    { role: 'system', content: SYSTEM_PROMPT },
     { role: 'user', content: userContent },
   ];
 
@@ -385,7 +387,7 @@ Select the next tool call.`;
   let parsedArgs = null;
 
   try {
-    data = await executeGroqRequest({ apiKey, model, messages, temperature: 0.1, timeoutMs });
+    data = await executeGroqRequest({ apiKey, model, messages, temperature: 0.1, timeoutMs, reasoningEffort: effort });
     const choice = data.choices?.[0];
     const message = choice?.message;
 
@@ -401,7 +403,7 @@ Select the next tool call.`;
   // If Attempt 1 failed or yielded no tool call -> Retry 1 time at temperature 0.0
   if (!toolCall || !parsedArgs) {
     try {
-      data = await executeGroqRequest({ apiKey, model, messages, temperature: 0.0, timeoutMs });
+      data = await executeGroqRequest({ apiKey, model, messages, temperature: 0.0, timeoutMs, reasoningEffort: effort });
       const choice = data.choices?.[0];
       const message = choice?.message;
 

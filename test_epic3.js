@@ -17,6 +17,10 @@
  *    - Step limit enforcement (`stopped_limit` upon reaching max_step_limit)
  *    - Goal completion (`finished` code 1000 & D1 persistence)
  *
+ * Section 5 drives the scripted mock engine, which only answers when the server allows it:
+ *   npx wrangler dev --var ALLOW_MOCK_AI:true
+ * (A server without it ends the task with an `ai_error` frame instead of faking progress.)
+ *
  * Usage:
  *   node test_epic3.js
  *   node test_epic3.js --url http://127.0.0.1:8787
@@ -560,6 +564,7 @@ async function main() {
     };
 
     const decision = await decide_action({
+      env: { ALLOW_MOCK_AI: 'true' },
       instruction: 'ค้นหาเพื่อน',
       screen_tree: richTree,
     });
@@ -575,6 +580,7 @@ async function main() {
 
   await test('Adapter: Selects open_app when instruction requests launching an application', async () => {
     const decision = await decide_action({
+      env: { ALLOW_MOCK_AI: 'true' },
       instruction: 'เปิดแอป LINE ให้หน่อย',
       screen_tree: {
         class: 'android.widget.FrameLayout',
@@ -596,6 +602,7 @@ async function main() {
     const screenshot = 'data:image/png;base64,mockScreenshotBytes';
 
     const decision = await decide_action({
+      env: { ALLOW_MOCK_AI: 'true' },
       instruction: 'กดปุ่มบนหน้าจอ',
       screen_tree: emptyTree,
       screenshot,

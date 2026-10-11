@@ -1,12 +1,18 @@
 /**
  * Hollis Screen Control — OpenRouter API Connector (Vision Mode)
  *
- * Connects to OpenRouter API targeting Qwen3-VL (or Qwen-2.5-VL)
- * accepting screenshot images in Base64 format when the accessibility tree is insufficient.
+ * Connects to OpenRouter API targeting Qwen3-VL (or Qwen-2.5-VL), used when the accessibility
+ * tree is too thin to act on. The model sees the screenshot plus whatever elements were readable
+ * and answers with the SAME 8 tools as Text Mode, so every engine speaks one protocol.
  */
+
+import { HOLLIS_TOOLS, formatElementsToOneLine, normalizeToolAction } from './groq.js';
+import { SYSTEM_PROMPT, buildUserPrompt } from './prompt.js';
 
 const OPENROUTER_COMPLETIONS_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const DEFAULT_VISION_MODEL = 'qwen/qwen-2.5-vl-72b-instruct';
+
+const TOOL_NAMES = HOLLIS_TOOLS.map((t) => t.function.name);
 
 /**
  * Normalizes image input to a valid Base64 Data URL.
@@ -23,26 +29,54 @@ function normalizeImageUrl(screenshot) {
   return `data:image/jpeg;base64,${trimmed}`;
 }
 
+/** One line per tool: name(param: type) — what it does. The vision model has no tool-calling schema. */
+function describeToolsForPrompt() {
+  return HOLLIS_TOOLS.map((t) => {
+    const { name, description, parameters } = t.function;
+    const required = new Set(parameters.required || []);
+    const args = Object.entries(parameters.properties || {})
+      .map(([k, v]) => {
+        const kind = v.enum ? v.enum.join('|') : v.type;
+        return `${k}${required.has(k) ? '' : '?'}: ${kind}`;
+      })
+      .join(', ');
+    return `- ${name}(${args}) — ${description}`;
+  }).join('\n');
+}
+
+/** Pulls the first JSON object out of a model reply (plain, fenced, or surrounded by prose). */
+function parseJsonReply(content) {
+  const text = content.trim();
+  try {
+    return JSON.parse(text);
+  } catch {
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    const braces = text.match(/\{[\s\S]*\}/);
+    const candidate = fenced ? fenced[1] : braces ? braces[0] : null;
+    if (!candidate) {
+      throw new Error(`Failed to parse structured JSON from OpenRouter response: ${text.slice(0, 100)}`);
+    }
+    return JSON.parse(candidate.trim());
+  }
+}
+
 /**
- * Calls OpenRouter Vision Model with image and instruction.
+ * Calls the OpenRouter vision model with the screenshot and returns a normalized tool action.
+ *
+ * `click_coordinate` x/y are returned exactly as the model gave them: fractions of the screenshot
+ * (0.0–1.0). The caller converts them to device pixels, because only it knows the screen size.
  *
  * @param {object} params
  * @param {string} params.apiKey - OpenRouter API key
  * @param {string} params.instruction - User command
  * @param {string} params.screenshot - Base64 encoded screenshot
- * @param {any} [params.screen_tree] - Optional partial accessibility tree
- * @param {Array} [params.history] - Action history
+ * @param {any} [params.screen_tree] - Whatever elements were readable (may be empty)
+ * @param {Array} [params.history] - AgentLoop history
+ * @param {object} [params.context] - { package, screen, installed_apps }
+ * @param {string | null} [params.feedback] - Why the previous attempt this turn was rejected
  * @param {string} [params.model] - Model name (default: qwen/qwen-2.5-vl-72b-instruct)
  * @param {number} [params.timeoutMs=20000] - Request timeout in ms
- * @returns {Promise<{
- *   action_type: string,
- *   target: string,
- *   coordinates: { x: number, y: number } | null,
- *   text: string | null,
- *   log_message: string,
- *   is_completed: boolean,
- *   raw_response?: any
- * }>}
+ * @returns {Promise<object>} Normalized action (see normalizeToolAction)
  */
 export async function callOpenRouterVisionModel({
   apiKey,
@@ -50,6 +84,8 @@ export async function callOpenRouterVisionModel({
   screenshot,
   screen_tree,
   history = [],
+  context = {},
+  feedback = null,
   model = DEFAULT_VISION_MODEL,
   timeoutMs = 20000,
 }) {
@@ -63,30 +99,23 @@ export async function callOpenRouterVisionModel({
 
   const imageUrl = normalizeImageUrl(screenshot);
 
-  const systemPrompt = `You are Hollis, an Android UI Screen Automation Vision Agent.
-You inspect the current screen screenshot and user instruction to identify UI controls and select the NEXT action.
+  const systemPrompt = `${SYSTEM_PROMPT}
 
-You MUST respond ONLY with a valid JSON object strictly matching this schema:
-{
-  "action_type": "tap" | "type_text" | "scroll_down" | "scroll_up" | "back" | "home" | "complete",
-  "target": "Visual description of the target UI element or button",
-  "coordinates": { "x": 0.5, "y": 0.5 },
-  "text": "Text to type if action_type is type_text, or null",
-  "log_message": "Concise log message in Thai",
-  "is_completed": true | false
-}
+You are looking at a SCREENSHOT of the phone, because the accessibility element list is too thin to act on alone.
+Available tools:
+${describeToolsForPrompt()}
 
-Coordinates are normalized between 0.0 and 1.0 (x: horizontal fraction, y: vertical fraction).
-If the user's task is already complete on screen, return "action_type": "complete" and "is_completed": true.
-Do NOT enclose output in Markdown code fences; return raw JSON only.`;
+Reply with ONLY one raw JSON object (no markdown, no prose):
+{"tool_name": "<tool>", "parameters": { ... }, "log_message": "<short Thai sentence describing this step>"}
+For click_coordinate, give x and y as FRACTIONS of the screenshot, each between 0.0 and 1.0 (x=0.5, y=0.5 is the centre), not pixels.`;
 
-  const historySummary = history.length > 0
-    ? `\nPrevious actions taken:\n` + history.map((h, i) => `Step ${i + 1}: ${h.action?.action_type || h.action_type} - ${h.action?.target || h.log_message}`).join('\n')
-    : '';
-
-  const promptText = `User Goal: "${instruction}"
-${historySummary}
-Analyze the attached screen screenshot and return the next action JSON.`;
+  const promptText = `${buildUserPrompt({
+    instruction,
+    screenText: formatElementsToOneLine(screen_tree),
+    history,
+    context,
+    feedback,
+  })}\n\nThe screenshot of the current screen is attached.`;
 
   const messages = [
     { role: 'system', content: systemPrompt },
@@ -130,61 +159,19 @@ Analyze the attached screen screenshot and return the next action JSON.`;
       throw new Error('OpenRouter API returned empty response content.');
     }
 
-    let parsedAction;
-    try {
-      parsedAction = JSON.parse(content.trim());
-    } catch {
-      const match = content.match(/```(?:json)?\s*([\s\S]*?)\s*```/) || content.match(/\{[\s\S]*\}/);
-      if (match) {
-        parsedAction = JSON.parse(match[1] ? match[1].trim() : match[0].trim());
-      } else {
-        throw new Error(`Failed to parse structured JSON from OpenRouter response: ${content.slice(0, 100)}`);
-      }
+    const parsed = parseJsonReply(content);
+    const toolName = parsed.tool_name || parsed.action_type;
+    if (!TOOL_NAMES.includes(toolName)) {
+      throw new Error(`OpenRouter model chose an unknown tool: ${JSON.stringify(toolName)}`);
     }
+    const params = parsed.parameters && typeof parsed.parameters === 'object' ? { ...parsed.parameters } : {};
 
-    let toolName = 'click_coordinate';
-    let params = {};
-
-    if (parsedAction.action_type === 'complete' || parsedAction.is_completed) {
-      toolName = 'task_finish';
-      params = {
-        status: 'success',
-        message: parsedAction.log_message || 'ภารกิจเสร็จสิ้นเรียบร้อยแล้ว',
-      };
-    } else if (parsedAction.action_type === 'back' || parsedAction.action_type === 'home') {
-      toolName = 'system_navigation';
-      params = {
-        action: parsedAction.action_type.toUpperCase(),
-      };
-    } else if (parsedAction.action_type === 'scroll_down' || parsedAction.action_type === 'scroll_up') {
-      toolName = 'swipe_screen';
-      params = {
-        direction: parsedAction.action_type === 'scroll_down' ? 'DOWN' : 'UP',
-      };
-    } else {
-      toolName = 'click_coordinate';
-      params = {
-        x: parsedAction.coordinates?.x !== undefined ? Math.round(parsedAction.coordinates.x * 1000) / 1000 : 0.5,
-        y: parsedAction.coordinates?.y !== undefined ? Math.round(parsedAction.coordinates.y * 1000) / 1000 : 0.5,
-        target_description: parsedAction.target || 'จุดเป้าหมายจากภาพหน้าจอ',
-      };
+    const action = normalizeToolAction(toolName, params, data);
+    if (parsed.log_message && toolName !== 'task_finish') {
+      action.log_message = String(parsed.log_message);
     }
-
-    return {
-      action_type: toolName,
-      tool_name: toolName,
-      parameters: params,
-      element_id: null,
-      target: parsedAction.target || params.target_description || 'target from vision',
-      target_id: null,
-      coordinates: parsedAction.coordinates || (params.x !== undefined ? { x: params.x, y: params.y } : null),
-      text: parsedAction.text || null,
-      log_message: parsedAction.log_message || `ตรวจพบและดำเนินการ ${toolName}`,
-      is_completed: toolName === 'task_finish',
-      raw_response: data,
-    };
+    return action;
   } finally {
     clearTimeout(timer);
   }
 }
-

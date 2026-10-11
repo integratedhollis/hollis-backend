@@ -36,6 +36,12 @@ export default {
           service: 'hollis-backend',
           phase: 3,
           message: 'Hollis Backend Edge Service running (Phases 1, 2 & 3 active).',
+          // Which AI engines are configured (never the keys themselves). Without any, tasks fail with ai_error.
+          ai: {
+            groq: Boolean(env.GROQ_API_KEY),
+            openrouter: Boolean(env.OPENROUTER_API_KEY),
+            mock_allowed: env.ALLOW_MOCK_AI === 'true',
+          },
         });
       }
 

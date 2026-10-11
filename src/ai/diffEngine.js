@@ -72,7 +72,10 @@ function flattenTree(root) {
     const clickable = Boolean(node.clickable || node.is_clickable);
     const bounds = typeof node.bounds === 'object' ? JSON.stringify(node.bounds) : String(node.bounds || '');
 
-    nodes.push({ key, text, className, clickable, bounds });
+    // Toggles and enabled/disabled flips change the screen without changing any text.
+    const state = `${node.checked ? 1 : 0}${node.selected ? 1 : 0}${node.enabled === false ? 0 : 1}`;
+
+    nodes.push({ key, text, className, clickable, bounds, state });
 
     const children = Array.isArray(node.children)
       ? node.children
@@ -209,6 +212,7 @@ export function verify_step(state_before, state_after) {
       b.text !== a.text ||
       b.className !== a.className ||
       b.clickable !== a.clickable ||
+      b.state !== a.state ||
       b.bounds !== a.bounds
     ) {
       changedNodes++;

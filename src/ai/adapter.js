@@ -4,13 +4,14 @@
  * Automatically chooses between Text Mode (Groq / gpt-oss-120b) and Vision Mode (OpenRouter / Qwen3-VL)
  * based on Accessibility Tree Quality evaluation.
  *
- * Defaults to intelligent Mock Engine for deterministic, offline, and local test execution
- * when API keys are not supplied.
+ * The scripted Mock Engine is for tests and offline development only: it runs when
+ * env.ALLOW_MOCK_AI === 'true'. Without it a missing key or a failing model is an explicit error.
  */
 
 import { check_tree_quality } from './treeQuality.js';
-import { callGroqTextModel } from './groq.js';
+import { callGroqTextModel, HOLLIS_TOOLS } from './groq.js';
 import { callOpenRouterVisionModel } from './openrouter.js';
+import { elementList, findElement, resolveInstalledApp } from './prompt.js';
 
 /**
  * Intelligent Mock Engine producing dynamic automation actions
@@ -257,15 +258,126 @@ export function runMockEngine({ instruction = '', screen_tree, screenshot, histo
   };
 }
 
+/** Raised when no real AI engine could produce a decision. The loop reports it to the user instead of faking progress. */
+export class AIEngineError extends Error {
+  /**
+   * @param {'ai_not_configured' | 'ai_unavailable' | 'ai_no_input'} code
+   * @param {string} message
+   * @param {string[]} [details]
+   */
+  constructor(code, message, details = []) {
+    super(message);
+    this.name = 'AIEngineError';
+    this.code = code;
+    this.details = details;
+  }
+}
+
+const TOOL_NAMES = HOLLIS_TOOLS.map((t) => t.function.name);
+
 /**
- * Unified Decision Engine: decides next action by evaluating tree quality,
- * selecting the optimal model (Text vs Vision), and executing via live API or mock engine.
+ * Checks a model's tool call against the current screen before it is sent to the phone.
+ * @returns {string | null} A message the model can act on, or null when the call is usable.
+ */
+export function validateDecision(action, screen_tree) {
+  const tool = action?.tool_name || action?.action_type;
+  if (!TOOL_NAMES.includes(tool)) return `"${tool}" is not one of the available tools.`;
+  const p = action.parameters || {};
+
+  switch (tool) {
+    case 'click_element':
+    case 'input_text': {
+      if (p.element_id === null || p.element_id === undefined || p.element_id === '' || !Number.isInteger(Number(p.element_id))) {
+        return `${tool} needs an integer element_id.`;
+      }
+      const list = elementList(screen_tree);
+      if (list && !findElement(screen_tree, p.element_id)) {
+        return `There is no element with id ${p.element_id} on the current screen (valid ids are 0-${list.length - 1}).`;
+      }
+      if (tool === 'input_text' && typeof p.text !== 'string') return 'input_text needs a text string.';
+      return null;
+    }
+    case 'click_coordinate':
+      return p.x !== null && p.y !== null && p.x !== undefined && p.y !== undefined &&
+        Number.isFinite(Number(p.x)) && Number.isFinite(Number(p.y))
+        ? null
+        : 'click_coordinate needs numeric x and y.';
+    case 'swipe_screen':
+      return ['UP', 'DOWN', 'LEFT', 'RIGHT'].includes(String(p.direction).toUpperCase())
+        ? null
+        : 'swipe_screen direction must be UP, DOWN, LEFT or RIGHT.';
+    case 'system_navigation':
+      return ['BACK', 'HOME', 'RECENTS'].includes(String(p.action).toUpperCase())
+        ? null
+        : 'system_navigation action must be BACK, HOME or RECENTS.';
+    case 'open_app':
+      return typeof p.app_name === 'string' && p.app_name.trim() ? null : 'open_app needs an app_name.';
+    default:
+      return null;
+  }
+}
+
+/** Calls an engine, and if its answer fails validation asks once more with the reason attached. */
+async function callWithValidation(call, screen_tree) {
+  let feedback = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const action = await call(feedback);
+    const problem = validateDecision(action, screen_tree);
+    if (!problem) return action;
+    console.warn(`[AIAdapter] Invalid tool call (attempt ${attempt + 1}): ${problem}`);
+    feedback = problem;
+  }
+  throw new Error(`Model returned an invalid tool call twice: ${feedback}`);
+}
+
+/** Fixes up a validated decision: real package for open_app, device pixels for vision taps, clamped waits. */
+function finalizeParameters(action, { engine, context }) {
+  const params = { ...(action.parameters || {}) };
+  const tool = action.tool_name || action.action_type;
+  const apps = Array.isArray(context.installed_apps) ? context.installed_apps : [];
+
+  if (tool === 'open_app') {
+    const app = resolveInstalledApp(apps, params.app_name);
+    if (app) {
+      params.app_name = app.name;
+      params.package_name = app.package;
+    } else if (apps.length > 0 && params.package_name && !apps.some((a) => a.package === params.package_name)) {
+      // A package the model made up; let the phone resolve the app by name instead.
+      delete params.package_name;
+    }
+  } else if (tool === 'swipe_screen') {
+    params.direction = String(params.direction).toUpperCase();
+  } else if (tool === 'system_navigation') {
+    params.action = String(params.action).toUpperCase();
+  } else if (tool === 'wait_and_poll') {
+    params.duration_ms = Math.max(500, Math.min(3000, Number(params.duration_ms) || 1000));
+  } else if (tool === 'click_coordinate' && engine === 'openrouter') {
+    // The vision model answers in fractions of the screenshot; the phone taps in pixels.
+    const x = Number(params.x);
+    const y = Number(params.y);
+    const { w, h } = context.screen || {};
+    if (x >= 0 && x <= 1 && y >= 0 && y <= 1 && w > 0 && h > 0) {
+      params.x = Math.round(x * w);
+      params.y = Math.round(y * h);
+    }
+  }
+  return params;
+}
+
+/**
+ * Unified Decision Engine: decides the next action by evaluating tree quality, choosing the
+ * preferred model (Text vs Vision), and falling back to the other one when it cannot be used.
+ *
+ * There is NO silent fake fallback: when no real engine can answer, this throws an
+ * {@link AIEngineError}. The scripted mock engine only runs when `env.ALLOW_MOCK_AI === 'true'`
+ * (tests / offline development) or when a test forces it through `options`.
  *
  * @param {object} params
  * @param {string} params.instruction - User command
- * @param {any} [params.screen_tree] - Screen accessibility hierarchy
+ * @param {any} [params.screen_tree] - Screen accessibility hierarchy / flat element list
  * @param {string} [params.screenshot] - Screen image Base64
- * @param {Array} [params.history] - Array of past step records
+ * @param {Array} [params.history] - AgentLoop history entries
+ * @param {{package?: string, screen?: {w: number, h: number}, installed_apps?: Array<{name: string, package: string}>}} [params.context] - Device facts reported by the phone
  * @param {Record<string, any>} [params.env] - Cloudflare worker env containing API keys
  * @param {object} [params.options] - Custom options or forced settings
  * @returns {Promise<{
@@ -289,6 +401,7 @@ export async function decide_action({
   screen_tree,
   screenshot,
   history = [],
+  context = {},
   env = {},
   options = {},
 }) {
@@ -296,72 +409,127 @@ export async function decide_action({
   const treeQuality = check_tree_quality(screen_tree);
   const preferredMode = options.forced_mode || treeQuality.mode; // 'text' | 'vision'
 
-  let action;
-  let engineUsed = 'mock';
+  const mockForced = Boolean(options.force_mock || options.mockAction || options.mockSequence || options.simulate_loop);
+  const mockAllowed = mockForced || env?.ALLOW_MOCK_AI === 'true';
 
-  // 2. Text Mode path (DO NOT pass screenshot image to minimize token latency)
-  if (preferredMode === 'text') {
-    if (env && env.GROQ_API_KEY && !options.force_mock) {
+  let action = null;
+  let engineUsed = 'mock';
+  let modeUsed = preferredMode;
+  const failures = [];
+
+  if (!mockForced) {
+    const canText = Boolean(env?.GROQ_API_KEY);
+    const canVision = Boolean(env?.OPENROUTER_API_KEY) && Boolean(screenshot);
+    // Text mode can run on a thin tree too, as long as there is at least one element to talk about.
+    const hasElements = (elementList(screen_tree)?.length || 0) > 0 || (!elementList(screen_tree) && Boolean(screen_tree));
+
+    const text = {
+      mode: 'text',
+      engine: 'groq',
+      usable: canText && hasElements,
+      run: () =>
+        callWithValidation(
+          (feedback) =>
+            callGroqTextModel({
+              apiKey: env.GROQ_API_KEY,
+              instruction,
+              screen_tree,
+              history,
+              context,
+              feedback,
+              model: env.GROQ_MODEL || undefined,
+              reasoningEffort: env.GROQ_REASONING_EFFORT || undefined,
+            }),
+          screen_tree
+        ),
+    };
+    const vision = {
+      mode: 'vision',
+      engine: 'openrouter',
+      usable: canVision,
+      run: () =>
+        callWithValidation(
+          (feedback) =>
+            callOpenRouterVisionModel({
+              apiKey: env.OPENROUTER_API_KEY,
+              instruction,
+              screenshot,
+              screen_tree,
+              history,
+              context,
+              feedback,
+              model: env.OPENROUTER_MODEL || undefined,
+            }),
+          screen_tree
+        ),
+    };
+
+    // Preferred engine first; the other one only if the first cannot be used or fails.
+    for (const candidate of preferredMode === 'text' ? [text, vision] : [vision, text]) {
+      if (!candidate.usable) continue;
       try {
-        action = await callGroqTextModel({
-          apiKey: env.GROQ_API_KEY,
-          instruction,
-          screen_tree,
-          history,
-          model: env.GROQ_MODEL,
-        });
-        engineUsed = 'groq';
+        action = await candidate.run();
+        engineUsed = candidate.engine;
+        modeUsed = candidate.mode;
+        break;
       } catch (err) {
-        console.warn('[AIAdapter] Groq API call failed, falling back to mock:', err.message);
-        action = runMockEngine({ instruction, screen_tree, screenshot: null, history, mode: 'text', options });
-        engineUsed = 'mock_fallback';
+        console.warn(`[AIAdapter] ${candidate.engine} failed:`, err.message);
+        failures.push(`${candidate.engine}: ${err.message}`);
       }
-    } else {
-      action = runMockEngine({ instruction, screen_tree, screenshot: null, history, mode: 'text', options });
-      engineUsed = 'mock';
     }
-  } else {
-    // 3. Vision Mode path (Send screenshot only on fallback turns)
-    if (env && env.OPENROUTER_API_KEY && screenshot && !options.force_mock) {
-      try {
-        action = await callOpenRouterVisionModel({
-          apiKey: env.OPENROUTER_API_KEY,
-          instruction,
-          screenshot,
-          screen_tree,
-          history,
-          model: env.OPENROUTER_MODEL,
-        });
-        engineUsed = 'openrouter';
-      } catch (err) {
-        console.warn('[AIAdapter] OpenRouter API call failed, falling back to mock:', err.message);
-        action = runMockEngine({ instruction, screen_tree, screenshot, history, mode: 'vision', options });
-        engineUsed = 'mock_fallback';
+
+    if (!action && !mockAllowed) {
+      if (failures.length > 0) {
+        throw new AIEngineError('ai_unavailable', 'ระบบ AI ตอบกลับไม่สำเร็จ กรุณาลองใหม่อีกครั้ง', failures);
       }
-    } else {
-      action = runMockEngine({ instruction, screen_tree, screenshot, history, mode: 'vision', options });
-      engineUsed = 'mock';
+      if (!canText && !env?.OPENROUTER_API_KEY) {
+        throw new AIEngineError(
+          'ai_not_configured',
+          'ระบบ AI ยังไม่ได้ตั้งค่า (ไม่มี GROQ_API_KEY / OPENROUTER_API_KEY บนเซิร์ฟเวอร์)'
+        );
+      }
+      throw new AIEngineError(
+        'ai_no_input',
+        'อ่านหน้าจอนี้ไม่ได้ (ไม่มีทั้งข้อมูล UI และภาพหน้าจอ) จึงไม่สามารถทำงานต่อได้',
+        [treeQuality.reason]
+      );
     }
+    if (!action) engineUsed = failures.length > 0 ? 'mock_fallback' : 'mock';
+  }
+
+  if (!action) {
+    action = runMockEngine({
+      instruction,
+      screen_tree,
+      screenshot: preferredMode === 'text' ? null : screenshot,
+      history,
+      mode: preferredMode,
+      options,
+    });
+    modeUsed = preferredMode;
   }
 
   const toolName = action.tool_name || action.action_type || 'click_element';
-  const parameters = action.parameters || {};
+  const isMock = engineUsed === 'mock' || engineUsed === 'mock_fallback';
+  const parameters = isMock ? action.parameters || {} : finalizeParameters(action, { engine: engineUsed, context });
 
   return {
     action_type: toolName,
     tool_name: toolName,
     parameters,
-    element_id: action.element_id !== undefined ? action.element_id : (parameters.element_id !== undefined ? parameters.element_id : null),
+    element_id: action.element_id !== undefined && action.element_id !== null
+      ? action.element_id
+      : (parameters.element_id !== undefined ? parameters.element_id : null),
     target: action.target || parameters.target_description || parameters.text || toolName,
     target_id: action.target_id || (parameters.element_id !== undefined ? String(parameters.element_id) : null),
-    coordinates: action.coordinates || (parameters.x !== undefined && parameters.y !== undefined ? { x: parameters.x, y: parameters.y } : null),
+    coordinates: parameters.x !== undefined && parameters.y !== undefined ? { x: parameters.x, y: parameters.y } : (action.coordinates || null),
     text: action.text || parameters.text || null,
-    direction: action.direction || parameters.direction || null,
-    nav_action: action.nav_action || parameters.action || null,
-    duration_ms: action.duration_ms || parameters.duration_ms || null,
+    direction: parameters.direction || action.direction || null,
+    nav_action: parameters.action || action.nav_action || null,
+    duration_ms: parameters.duration_ms || action.duration_ms || null,
     log_message: action.log_message || `ดำเนินการ ${toolName}`,
     is_completed: toolName === 'task_finish' || Boolean(action.is_completed),
-    mode_used: preferredMode,
+    mode_used: modeUsed,
     engine_used: engineUsed,
     tree_quality: treeQuality,
   };

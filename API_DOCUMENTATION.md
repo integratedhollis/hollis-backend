@@ -565,7 +565,7 @@ val webSocket = client.newWebSocket(request, object : WebSocketListener() {
 | `click_element` | `element_id: Integer`, `target_description: String` | สั่งกดปุ่มหรือ View ตามรหัส ID จาก UI Tree (แม่นยำสูงสุด $O(1)$) |
 | `click_coordinate` | `x: Int`, `y: Int`, `target_description: String` | สั่งแตะพิกัดหน้าจอโดยตรง ใช้เมื่อ UI Tree มองไม่เห็นโหนดหรือทำงานกับ Canvas |
 | `input_text` | `element_id: Int`, `text: String` | สั่งกรอกข้อความลงในช่อง EditText ผ่าน Set Text Argument |
-| `swipe_screen` | `direction: Enum ["UP", "DOWN", "LEFT", "RIGHT"]` | สั่งปัดหรือเลื่อนหน้าจอตามทิศทางเพื่อค้นหาเนื้อหาที่อยู่นอกจอ |
+| `swipe_screen` | `direction: Enum ["UP", "DOWN", "LEFT", "RIGHT"]` | เลื่อนหน้าจอเพื่อค้นหาเนื้อหาที่อยู่นอกจอ `direction` คือทิศทางของ **เนื้อหาที่ต้องการเห็น**: `DOWN` = ดูเนื้อหาด้านล่างต่อ (นิ้วลากขึ้น), `UP` = ย้อนขึ้นด้านบน (นิ้วลากลง), `LEFT`/`RIGHT` = ดูเนื้อหาด้านซ้าย/ขวา |
 | `system_navigation` | `action: Enum ["BACK", "HOME", "RECENTS"]` | สั่งกดปุ่มควบคุมระบบปฏิบัติการ เช่น กดย้อนกลับ หรือกลับหน้าโฮม |
 | `wait_and_poll` | `duration_ms: Integer` (500 - 3000) | สั่งหยุดรอให้หน้าจอโหลดข้อมูลหรือรอแอนิเมชันเสร็จสิ้น |
 | `task_finish` | `status: Enum ["success", "failed"]`, `message: String` | แจ้งสิ้นสุดภารกิจ พร้อมข้อความสรุปผลลัพธ์ภาษาไทยแจ้งผู้ใช้ |
@@ -894,3 +894,32 @@ class HollisAccessibilityService : AccessibilityService() {
 }
 ```
 
+
+---
+
+### 4.5 ส่วนขยายของโปรโตคอล (ทุกฟิลด์เป็น optional — client เก่ายังใช้ได้)
+
+**Android → Backend** (`observe` และ `action_done`)
+
+| ฟิลด์ | ความหมาย |
+| :--- | :--- |
+| `package` | package ของแอปที่อยู่หน้าจอตอนนี้ ใช้ยืนยันว่า `open_app` เปิดถูกแอป |
+| `screen: { "w": 1080, "h": 2400 }` | ขนาดหน้าจอจริงเป็นพิกเซล ใช้แปลงพิกัด Vision (เศษส่วน 0–1) เป็นพิกเซล |
+| `installed_apps: [{ "name", "package" }]` | แอปที่มี launcher icon (ส่งใน `observe` แรก) AI เลือก `open_app` จากรายชื่อนี้ |
+| `status`, `message` (ใน `action_done`) | `ok`/`error` และเหตุผลที่ล้มเหลว — backend ส่งให้โมเดลเห็นในขั้นถัดไป |
+| ใน `screen_elements[]` | `desc` (content description เมื่อต่างจาก `text`), `hint`, `checked`, `scrollable`, `selected`, `enabled:false` |
+
+หน้าจอส่งได้ทั้ง `screen_elements` (array แบนตามเอกสาร) และ `screen_tree` (รูปแบบเดิม)
+
+**Backend → Android**
+
+* `action` และ `log` มี `engine_used` (`groq` | `openrouter`; `mock`/`mock_fallback` เกิดได้เฉพาะเมื่อเซิร์ฟเวอร์เปิด `ALLOW_MOCK_AI`)
+* **`ai_error`** — AI ตัดสินใจไม่ได้ (ไม่ได้ตั้ง key, API ล่ม, อ่านหน้าจอไม่ได้) session จบเป็น `failed` แล้วปิด socket:
+
+```json
+{ "event": "ai_error", "status": "failed", "code": "ai_not_configured", "message": "ระบบ AI ยังไม่ได้ตั้งค่า ...", "step_count": 0 }
+```
+
+  `code` = `ai_not_configured` | `ai_unavailable` | `ai_no_input`
+* `finished` มี `status: "failed"` เมื่อโมเดลเรียก `task_finish` ด้วย `status: "failed"`
+* `GET /health` มี `ai: { groq, openrouter, mock_allowed }` (boolean ว่าตั้ง key แล้วหรือยัง ไม่เปิดเผยค่า)

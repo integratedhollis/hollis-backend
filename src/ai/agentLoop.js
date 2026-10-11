@@ -9,9 +9,10 @@
  * 5. Verify    -> Compute structural diff (verified_changed: 0 or 1), detect loops (stopped_loop) & enforce limits (stopped_limit)
  */
 
-import { decide_action } from './adapter.js';
+import { decide_action, AIEngineError } from './adapter.js';
 import { check_risk } from './riskEngine.js';
 import { verify_step } from './diffEngine.js';
+import { findElement } from './prompt.js';
 
 /**
  * Delays execution for ms milliseconds, resolving immediately if signal aborts.
@@ -44,6 +45,31 @@ function abortableSleep(ms, signal) {
 function extractScreen(data) {
   if (!data || typeof data !== 'object') return null;
   return data.screen_tree ?? data.screen_elements ?? null;
+}
+
+/** Tools whose whole point is to leave the screen as it is (or end the task); "unchanged" is not a failure for them. */
+const NO_VISIBLE_EFFECT_TOOLS = new Set(['wait_and_poll', 'task_finish']);
+/** Tools that can touch money, messages or data, so their real target is checked for risky words. */
+const RISK_CHECKED_TOOLS = new Set(['click_element', 'click_coordinate', 'input_text']);
+const MAX_INSTALLED_APPS = 400;
+
+/**
+ * What to scan for risky words. The model's own description of a tap is not enough ("button 3"),
+ * so the label of the element that will really be tapped is included. Text the user asked to
+ * type is deliberately left out: typing "send" into a search box is not a risky act.
+ * @returns {object | null} null when the tool cannot cause anything irreversible.
+ */
+function buildRiskSubject(decision, screenTree) {
+  const tool = decision.tool_name || decision.action_type;
+  if (!RISK_CHECKED_TOOLS.has(tool)) return null;
+  const params = decision.parameters || {};
+  const element = findElement(screenTree, params.element_id);
+  const subject = { element_text: element?.text, element_desc: element?.desc };
+  if (tool !== 'input_text') {
+    subject.target = decision.target;
+    subject.target_description = params.target_description;
+  }
+  return subject;
 }
 
 export class AgentLoop {
@@ -85,6 +111,8 @@ export class AgentLoop {
 
     this.isInteractive = false;
     this.latestObservation = null;
+    /** What the phone has told us about itself: foreground app, screen size, installed apps. */
+    this.deviceContext = { package: null, screen: null, installed_apps: [] };
 
     this.pendingConfirmResolver = null;
     this.pendingConfirmStepId = null;
@@ -168,6 +196,7 @@ export class AgentLoop {
    */
   async handleObserve(data) {
     this.isInteractive = true;
+    this.absorbDeviceFacts(data);
     const screenTree = extractScreen(data);
     this.latestObservation = {
       screen_tree: screenTree,
@@ -181,6 +210,7 @@ export class AgentLoop {
       resolver({
         screen_tree: screenTree,
         screenshot: data.screenshot || null,
+        package: data.package || null,
         status: 'ok',
       });
       return;
@@ -192,10 +222,35 @@ export class AgentLoop {
   }
 
   /**
+   * Remembers what the phone reports about itself so the model can use it on every turn.
+   * All fields are optional (older clients send none of them).
+   * @param {object} data - observe / action_done frame: { package, screen: {w, h}, installed_apps: [{name, package}] }
+   */
+  absorbDeviceFacts(data) {
+    if (!data || typeof data !== 'object') return;
+    const ctx = this.deviceContext;
+    if (typeof data.package === 'string' && data.package) {
+      ctx.package = data.package;
+    }
+    const w = Number(data.screen?.w);
+    const h = Number(data.screen?.h);
+    if (w > 0 && h > 0) {
+      ctx.screen = { w: Math.round(w), h: Math.round(h) };
+    }
+    if (Array.isArray(data.installed_apps) && data.installed_apps.length > 0) {
+      ctx.installed_apps = data.installed_apps
+        .filter((a) => a && typeof a.name === 'string' && typeof a.package === 'string' && a.name.trim())
+        .slice(0, MAX_INSTALLED_APPS)
+        .map((a) => ({ name: a.name.trim(), package: a.package }));
+    }
+  }
+
+  /**
    * Handles incoming `action_done` frame from client.
-   * @param {object} data - { step_no, screen_tree, screenshot, status }
+   * @param {object} data - { step_no, screen_tree | screen_elements, screenshot, status, message, package }
    */
   handleActionDone(data) {
+    this.absorbDeviceFacts(data);
     if (this.pendingActionResolver) {
       const resolver = this.pendingActionResolver;
       this.pendingActionResolver = null;
@@ -276,6 +331,40 @@ export class AgentLoop {
   }
 
   /**
+   * The AI engine could not decide (not configured, API down, no readable screen). Tell the phone
+   * plainly and end the task as failed, rather than pretending it succeeded.
+   * @param {unknown} err
+   */
+  async failWithAiError(err) {
+    const code = err instanceof AIEngineError ? err.code : 'ai_unavailable';
+    const message =
+      err instanceof AIEngineError ? err.message : 'ระบบ AI ขัดข้อง ไม่สามารถทำงานต่อได้ กรุณาลองใหม่อีกครั้ง';
+    console.error(`[AgentLoop ${this.sessionId}] AI engine error (${code}):`, err?.message, err?.details || '');
+
+    this.status = 'failed';
+    const endedAt = new Date().toISOString();
+    try {
+      await this.env.DB.prepare(
+        `UPDATE sessions SET status = 'failed', ended_at = ? WHERE id = ? AND user_id = ? AND status = 'running'`
+      ).bind(endedAt, this.sessionId, this.userId).run();
+    } catch (dbErr) {
+      console.warn(`[AgentLoop ${this.sessionId}] Failed to persist ai_error:`, dbErr.message);
+    }
+
+    this.sendFrame({
+      event: 'ai_error',
+      session_id: this.sessionId,
+      status: 'failed',
+      code,
+      message,
+      summary_message: message,
+      total_steps: this.currentStep,
+      step_count: this.currentStep,
+    });
+    try { this.ws?.close(1000, 'AI engine error'); } catch (_) {}
+  }
+
+  /**
    * Starts autonomous execution if client has not sent interactive observe messages.
    * @param {number} [initialDelayMs=350]
    * @returns {Promise<void>}
@@ -348,14 +437,24 @@ export class AgentLoop {
         };
 
         // Step 2: DECIDE
-        const decision = await decide_action({
-          instruction: this.instruction,
-          screen_tree: stateBefore.screen_tree,
-          screenshot: stateBefore.screenshot,
-          history: this.history,
-          env: this.env,
-          options: { stepIndex: this.currentStep },
-        });
+        let decision;
+        try {
+          decision = await decide_action({
+            instruction: this.instruction,
+            screen_tree: stateBefore.screen_tree,
+            screenshot: stateBefore.screenshot,
+            history: this.history,
+            context: this.deviceContext,
+            env: this.env,
+            options: { stepIndex: this.currentStep },
+          });
+        } catch (err) {
+          if (this.isSuperseded || this.abortController.signal.aborted) {
+            break;
+          }
+          await this.failWithAiError(err);
+          break;
+        }
 
         if (this.isSuperseded) {
           break;
@@ -367,7 +466,7 @@ export class AgentLoop {
         }
 
         // Step 3: RISK CHECK
-        const riskResult = check_risk(decision);
+        const riskResult = check_risk(buildRiskSubject(decision, stateBefore.screen_tree));
         const isRisky = riskResult.is_risky;
         const stepId = crypto.randomUUID();
         const timestamp = new Date().toISOString();
@@ -495,6 +594,7 @@ export class AgentLoop {
           parameters: toolParams,
           action: decision,
           mode_used: decision.mode_used,
+          engine_used: decision.engine_used,
           is_risky: isRisky,
         });
 
@@ -507,6 +607,7 @@ export class AgentLoop {
           is_risky: isRisky,
           action_type: toolName,
           tool_name: toolName,
+          engine_used: decision.engine_used,
         });
 
         const isTaskFinish =
@@ -516,17 +617,19 @@ export class AgentLoop {
           decision.action_type === 'task_finish';
 
         if (isTaskFinish) {
-          this.status = 'completed';
+          // The model may report that it could not do the task; record that honestly.
+          const finalStatus = toolParams.status === 'failed' ? 'failed' : 'completed';
+          this.status = finalStatus;
           const endedAt = new Date().toISOString();
           await this.env.DB.prepare(
-            `UPDATE sessions SET status = 'completed', ended_at = ? WHERE id = ? AND user_id = ? AND status = 'running'`
-          ).bind(endedAt, this.sessionId, this.userId).run();
+            `UPDATE sessions SET status = ?, ended_at = ? WHERE id = ? AND user_id = ? AND status = 'running'`
+          ).bind(finalStatus, endedAt, this.sessionId, this.userId).run();
 
           const summaryMsg = toolParams.message || decision.log_message || 'งานเสร็จสมบูรณ์เรียบร้อยแล้ว';
           this.sendFrame({
             event: 'finished',
             session_id: this.sessionId,
-            status: 'completed',
+            status: finalStatus,
             total_steps: this.currentStep,
             step_count: this.currentStep,
             summary_message: summaryMsg,
@@ -537,6 +640,8 @@ export class AgentLoop {
 
         // Wait for action execution
         let stateAfter = null;
+        /** What the phone says happened: { status: 'ok' | 'error' | 'timeout', message, package } */
+        let result = { status: 'ok', message: null, package: null };
         if (this.isInteractive) {
           const actionDoneData = await new Promise((resolve) => {
             const timeout = setTimeout(() => {
@@ -562,6 +667,13 @@ export class AgentLoop {
               screen_tree: extractScreen(actionDoneData),
               screenshot: actionDoneData.screenshot || null,
             };
+            result = {
+              status: actionDoneData.status === 'error' ? 'error' : 'ok',
+              message: typeof actionDoneData.message === 'string' ? actionDoneData.message : null,
+              package: actionDoneData.package || null,
+            };
+          } else {
+            result = { status: 'timeout', message: null, package: null };
           }
         } else {
           // Autonomous delay (respect wait_and_poll duration if specified)
@@ -600,8 +712,8 @@ export class AgentLoop {
         }
 
         // Step 5: VERIFY
-        const diffResult = verify_step(stateBefore, stateAfter);
-        const verifiedChanged = diffResult.verified_changed;
+        // No screen came back (the phone never answered): nothing was verified, so it is not a change.
+        const verifiedChanged = stateAfter ? verify_step(stateBefore, stateAfter).verified_changed : 0;
 
         await this.env.DB.prepare(
           `UPDATE task_steps SET verified_changed = ? WHERE id = ?`
@@ -614,6 +726,7 @@ export class AgentLoop {
           state_before: stateBefore,
           state_after: stateAfter,
           verified_changed: verifiedChanged,
+          result,
         });
 
         if (stateAfter) {
@@ -622,11 +735,9 @@ export class AgentLoop {
 
         // --- TERMINATION CHECKS ---
 
-        // 1. Loop Detection
-        if (verifiedChanged === 0) {
-          this.unchangedStreak++;
-        } else {
-          this.unchangedStreak = 0;
+        // 1. Loop Detection (a deliberate wait leaves the screen alone, so it neither adds to nor resets the streak)
+        if (!NO_VISIBLE_EFFECT_TOOLS.has(toolName)) {
+          this.unchangedStreak = verifiedChanged === 0 ? this.unchangedStreak + 1 : 0;
         }
 
         if (this.unchangedStreak >= 3) {

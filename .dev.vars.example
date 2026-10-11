@@ -2,3 +2,14 @@
 # JWT_SECRET is REQUIRED (no built-in fallback). Use a long random value, e.g. `openssl rand -hex 32`.
 # In production set it with: npx wrangler secret put JWT_SECRET
 JWT_SECRET=your-secret-key-here-for-local-development
+
+# AI engines. Without at least one of these, tasks end with an "ai_error" instead of running.
+# Production: npx wrangler secret put GROQ_API_KEY   (and OPENROUTER_API_KEY for vision fallback)
+GROQ_API_KEY=
+OPENROUTER_API_KEY=
+# Optional overrides: GROQ_MODEL (default gpt-oss-120b), GROQ_REASONING_EFFORT (low|medium|high),
+# OPENROUTER_MODEL (default qwen/qwen-2.5-vl-72b-instruct)
+
+# Tests / offline development ONLY: lets the scripted mock engine answer when no key is set.
+# Never set this on a phone you actually use; it fakes a successful task.
+# ALLOW_MOCK_AI=true

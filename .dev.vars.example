@@ -9,7 +9,14 @@ GROQ_API_KEY=
 OPENROUTER_API_KEY=
 # Optional overrides: GROQ_MODEL (default openai/gpt-oss-120b), GROQ_REASONING_EFFORT (low|medium|high),
 # OPENROUTER_MODEL (default qwen/qwen-2.5-vl-72b-instruct)
+#
+# Text fallback chain when a model is rate-limited (429) or down:
+#   1. Groq        GROQ_MODEL           (default openai/gpt-oss-120b)
+#   2. Workers AI  CF_AI_MODEL          (default @cf/openai/gpt-oss-120b) via the "ai" binding in wrangler.jsonc
+#   3. Groq        GROQ_FALLBACK_MODEL  (default openai/gpt-oss-20b)
+# Workers AI needs no key in production. With `wrangler dev` it runs against your Cloudflare account
+# (remote, billed in neurons) and requires `wrangler login`.
 
-# Tests / offline development ONLY: lets the scripted mock engine answer when no key is set.
-# Never set this on a phone you actually use; it fakes a successful task.
-# ALLOW_MOCK_AI=true
+# Tests / offline development ONLY. Never set these on a phone you actually use; they fake a successful task.
+# ALLOW_MOCK_AI=true   scripted mock answers when no real engine is configured or all of them fail
+# FORCE_MOCK_AI=true   always use the mock (needed by test_epic3.js, which expects scripted answers)

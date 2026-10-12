@@ -597,6 +597,7 @@ export class AgentLoop {
           action: decision,
           mode_used: decision.mode_used,
           engine_used: decision.engine_used,
+          model_used: decision.model_used,
           is_risky: isRisky,
         });
 
@@ -610,6 +611,7 @@ export class AgentLoop {
           action_type: toolName,
           tool_name: toolName,
           engine_used: decision.engine_used,
+          model_used: decision.model_used,
         });
 
         const isTaskFinish =

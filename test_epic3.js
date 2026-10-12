@@ -17,9 +17,9 @@
  *    - Step limit enforcement (`stopped_limit` upon reaching max_step_limit)
  *    - Goal completion (`finished` code 1000 & D1 persistence)
  *
- * Section 5 drives the scripted mock engine, which only answers when the server allows it:
- *   npx wrangler dev --var ALLOW_MOCK_AI:true
- * (A server without it ends the task with an `ai_error` frame instead of faking progress.)
+ * Section 5 drives the scripted mock engine, so the server must be told to use it instead of a real model:
+ *   npx wrangler dev --var FORCE_MOCK_AI:true
+ * (A server with no AI engine ends the task with an `ai_error` frame instead of faking progress.)
  *
  * Usage:
  *   node test_epic3.js

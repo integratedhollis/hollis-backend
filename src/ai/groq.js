@@ -1,5 +1,5 @@
 /**
- * Hollis Screen Control — Groq Cloud API Connector (Text Mode)
+ * Hollis Screen Control — Text Mode connectors (Groq Cloud and Cloudflare Workers AI)
  *
  * Connects to Groq Cloud API using OpenAI-compatible Tool Calling (Function Calling)
  * targeting gpt-oss-120b with strict 7-tool schema per Mobile Agent Specification.
@@ -309,6 +309,40 @@ export function normalizeToolAction(toolName, args, rawResponse = null) {
   };
 }
 
+/** Default Cloudflare Workers AI model used when Groq is rate-limited or down. */
+export const DEFAULT_WORKERS_AI_MODEL = '@cf/openai/gpt-oss-120b';
+/** Last-resort smaller model on Groq (separate rate limits from the 120b). */
+export const DEFAULT_GROQ_FALLBACK_MODEL = 'openai/gpt-oss-20b';
+
+/**
+ * An HTTP-level failure from a model provider (rate limit, outage, bad model id, timeout).
+ * These are not worth retrying on the same model: the caller moves on to the next engine.
+ */
+export class ModelHttpError extends Error {
+  /**
+   * @param {string} message
+   * @param {{ status?: number | null, retryAfterMs?: number | null }} [info]
+   */
+  constructor(message, { status = null, retryAfterMs = null } = {}) {
+    super(message);
+    this.name = 'ModelHttpError';
+    this.status = status;
+    this.retryAfterMs = retryAfterMs;
+  }
+  get isRateLimit() {
+    return this.status === 429;
+  }
+}
+
+/** `Retry-After` is seconds (or an HTTP date); returns milliseconds, or null when absent/unusable. */
+function parseRetryAfter(value) {
+  if (!value) return null;
+  const secs = Number(value);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? null : Math.max(0, at - Date.now());
+}
+
 /**
  * Executes a single completion request to Groq API with Tool Calling.
  */
@@ -317,27 +351,35 @@ async function executeGroqRequest({ apiKey, model, messages, temperature = 0.1, 
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const res = await fetch(GROQ_COMPLETIONS_URL, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        tools: HOLLIS_TOOLS,
-        tool_choice: 'required',
-        temperature,
-        // gpt-oss only: bounds how long the model thinks before answering.
-        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
-      }),
-      signal: controller.signal,
-    });
+    let res;
+    try {
+      res = await fetch(GROQ_COMPLETIONS_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          tools: HOLLIS_TOOLS,
+          tool_choice: 'required',
+          temperature,
+          // gpt-oss only: bounds how long the model thinks before answering.
+          ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+        }),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      throw new ModelHttpError(`Groq request failed (${model}): ${err.name === 'AbortError' ? `timed out after ${timeoutMs}ms` : err.message}`);
+    }
 
     if (!res.ok) {
       const errorText = await res.text();
-      throw new Error(`Groq API returned HTTP ${res.status}: ${errorText}`);
+      throw new ModelHttpError(`Groq API returned HTTP ${res.status} (${model}): ${errorText}`, {
+        status: res.status,
+        retryAfterMs: parseRetryAfter(res.headers?.get?.('retry-after')),
+      });
     }
 
     return await res.json();
@@ -347,32 +389,94 @@ async function executeGroqRequest({ apiKey, model, messages, temperature = 0.1, 
 }
 
 /**
- * Calls Groq API in Text Mode with strict Tool Calling and Validation Retry Guard.
+ * Executes a single completion on Cloudflare Workers AI through the `AI` binding.
+ * The request and response use the OpenAI chat-completions shape, same as Groq.
+ */
+async function executeWorkersAIRequest({ ai, model, messages, temperature = 0.1, timeoutMs = 25000, reasoningEffort = null }) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new ModelHttpError(`Workers AI timed out after ${timeoutMs}ms (${model})`)), timeoutMs);
+  });
+  try {
+    const out = await Promise.race([
+      ai.run(model, {
+        messages,
+        tools: HOLLIS_TOOLS,
+        tool_choice: 'required',
+        temperature,
+        // Workers AI defaults to 256 tokens, which reasoning plus a tool call can exceed.
+        max_tokens: 1024,
+        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+      }),
+      timeout,
+    ]);
+    return out;
+  } catch (err) {
+    if (err instanceof ModelHttpError) throw err;
+    const text = String(err?.message || err);
+    // Workers AI reports capacity/rate problems in the message rather than as an HTTP status.
+    const status = /rate.?limit|capacity|too many|429/i.test(text) ? 429 : null;
+    throw new ModelHttpError(`Workers AI failed (${model}): ${text}`, { status });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The assistant message of a completion, tolerating the older Workers AI `{response, tool_calls}` shape. */
+function assistantMessage(data) {
+  if (data?.choices?.[0]?.message) return data.choices[0].message;
+  const legacyCalls = Array.isArray(data?.tool_calls) ? data.tool_calls : [];
+  return {
+    content: typeof data?.response === 'string' ? data.response : null,
+    tool_calls: legacyCalls.map((c) => ({
+      function: {
+        name: c.name,
+        arguments: typeof c.arguments === 'string' ? c.arguments : JSON.stringify(c.arguments || {}),
+      },
+    })),
+  };
+}
+
+/**
+ * Text Mode model call with strict Tool Calling, shared by every text provider.
+ * HTTP/transport failures throw straight away (the adapter falls back to the next engine);
+ * only an unusable answer (no tool call, bad JSON) is retried once at temperature 0.0.
  *
  * @param {object} params
- * @param {string} params.apiKey - Groq API key
+ * @param {'groq' | 'workers-ai'} params.provider
+ * @param {string} [params.apiKey] - Groq API key
+ * @param {{ run: Function }} [params.ai] - Workers AI binding
  * @param {string} params.instruction - User command
  * @param {any} [params.screen_tree] - Screen accessibility elements
  * @param {Array} [params.history] - Array of previous steps
- * @param {string} [params.model] - Model identifier (default: openai/gpt-oss-120b)
- * @param {number} [params.timeoutMs=15000] - Request timeout in ms
- * @returns {Promise<object>} Normalized Action Object
+ * @param {object} [params.context] - { package, screen, installed_apps }
+ * @param {string | null} [params.feedback] - Why the previous attempt this turn was rejected
+ * @param {string} [params.model]
+ * @param {string} [params.reasoningEffort]
+ * @param {number} [params.timeoutMs]
+ * @returns {Promise<object>} Normalized Action Object (see normalizeToolAction)
  */
-export async function callGroqTextModel({
+export async function callTextModel({
+  provider,
   apiKey,
+  ai,
   instruction,
   screen_tree,
   history = [],
   context = {},
   feedback = null,
-  model = DEFAULT_MODEL,
+  model,
   reasoningEffort = 'medium',
-  timeoutMs = 15000,
+  timeoutMs,
 }) {
-  if (!apiKey) {
-    throw new Error('Groq API Key is required.');
+  const isWorkersAI = provider === 'workers-ai';
+  if (isWorkersAI) {
+    if (!ai || typeof ai.run !== 'function') throw new Error('Workers AI binding (env.AI) is required.');
+    model = model || DEFAULT_WORKERS_AI_MODEL;
+  } else {
+    if (!apiKey) throw new Error('Groq API Key is required.');
+    model = resolveGroqModel(model);
   }
-  model = resolveGroqModel(model);
 
   const userContent = buildUserPrompt({
     instruction,
@@ -390,53 +494,51 @@ export async function callGroqTextModel({
     { role: 'user', content: userContent },
   ];
 
-  // Attempt 1 with temperature 0.1
-  let data;
-  let toolCall = null;
-  let parsedArgs = null;
+  const send = (temperature) =>
+    isWorkersAI
+      ? executeWorkersAIRequest({ ai, model, messages, temperature, reasoningEffort: effort, ...(timeoutMs ? { timeoutMs } : {}) })
+      : executeGroqRequest({ apiKey, model, messages, temperature, reasoningEffort: effort, ...(timeoutMs ? { timeoutMs } : {}) });
 
-  try {
-    data = await executeGroqRequest({ apiKey, model, messages, temperature: 0.1, timeoutMs, reasoningEffort: effort });
-    const choice = data.choices?.[0];
-    const message = choice?.message;
+  const label = isWorkersAI ? 'WorkersAI' : 'Groq';
+  let lastProblem = 'no tool call in the response';
 
-    if (message?.tool_calls && message.tool_calls.length > 0) {
-      toolCall = message.tool_calls[0].function;
-      parsedArgs = JSON.parse(toolCall.arguments || '{}');
-    }
-  } catch (err) {
-    // Validation Guard: Retry 1 time immediately with temperature 0.0 per specification
-    console.warn('[Groq] Attempt 1 failed or invalid tool call, retrying with temperature 0.0:', err.message);
-  }
+  // Attempt 1 at temperature 0.1, then one more at 0.0 if the answer was unusable (per specification).
+  for (const temperature of [0.1, 0.0]) {
+    const data = await send(temperature);
+    const message = assistantMessage(data);
 
-  // If Attempt 1 failed or yielded no tool call -> Retry 1 time at temperature 0.0
-  if (!toolCall || !parsedArgs) {
-    try {
-      data = await executeGroqRequest({ apiKey, model, messages, temperature: 0.0, timeoutMs, reasoningEffort: effort });
-      const choice = data.choices?.[0];
-      const message = choice?.message;
-
-      if (message?.tool_calls && message.tool_calls.length > 0) {
-        toolCall = message.tool_calls[0].function;
-        parsedArgs = JSON.parse(toolCall.arguments || '{}');
-      } else if (message?.content) {
-        // Fallback: check if model returned JSON in content
-        const match = message.content.match(/\{[\s\S]*\}/);
-        if (match) {
+    if (message.tool_calls && message.tool_calls.length > 0) {
+      const call = message.tool_calls[0].function;
+      try {
+        return normalizeToolAction(call.name, JSON.parse(call.arguments || '{}'), data);
+      } catch (err) {
+        lastProblem = `tool arguments were not valid JSON: ${err.message}`;
+      }
+    } else if (message.content) {
+      // Fallback: some answers put the call in the content as JSON.
+      const match = message.content.match(/\{[\s\S]*\}/);
+      if (match) {
+        try {
           const parsed = JSON.parse(match[0]);
-          const name = parsed.tool_name || parsed.action_type || 'click_element';
-          return normalizeToolAction(name, parsed, data);
+          const name = parsed.tool_name || parsed.action_type;
+          if (name) return normalizeToolAction(name, parsed.parameters || parsed, data);
+        } catch (err) {
+          lastProblem = `content was not valid JSON: ${err.message}`;
         }
       }
-    } catch (retryErr) {
-      throw new Error(`Groq Tool Calling failed after temperature 0.0 retry: ${retryErr.message}`);
     }
+    console.warn(`[${label}] Unusable answer (${lastProblem}); ${temperature > 0 ? 'retrying with temperature 0.0' : 'giving up'}`);
   }
 
-  if (!toolCall || !parsedArgs) {
-    throw new Error('Groq model failed to return a valid tool call after retry.');
-  }
-
-  return normalizeToolAction(toolCall.name, parsedArgs, data);
+  throw new Error(`${label} model (${model}) failed to return a valid tool call after retry: ${lastProblem}`);
 }
 
+/** Groq Text Mode (kept for existing callers). */
+export function callGroqTextModel(params) {
+  return callTextModel({ ...params, provider: 'groq' });
+}
+
+/** Cloudflare Workers AI Text Mode. */
+export function callWorkersAITextModel(params) {
+  return callTextModel({ ...params, provider: 'workers-ai' });
+}

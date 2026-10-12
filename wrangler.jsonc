@@ -24,6 +24,10 @@
       "head_sampling_rate": 1
     }
   },
+  // Cloudflare Workers AI: second text engine when Groq is rate-limited or down (@cf/openai/gpt-oss-120b).
+  "ai": {
+    "binding": "AI"
+  },
   "d1_databases": [
     {
       "binding": "DB",

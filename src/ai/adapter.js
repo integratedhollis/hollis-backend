@@ -1,7 +1,8 @@
 /**
  * Hollis Screen Control — Pluggable Unified AI Adapter
  *
- * Automatically chooses between Text Mode (Groq / gpt-oss-120b) and Vision Mode (OpenRouter / Qwen3-VL)
+ * Automatically chooses between Text Mode (Groq openai/gpt-oss-120b, falling back to Cloudflare Workers AI
+ * @cf/openai/gpt-oss-120b, then Groq openai/gpt-oss-20b) and Vision Mode (OpenRouter / Qwen3-VL)
  * based on Accessibility Tree Quality evaluation.
  *
  * The scripted Mock Engine is for tests and offline development only: it runs when
@@ -9,7 +10,14 @@
  */
 
 import { check_tree_quality } from './treeQuality.js';
-import { callGroqTextModel, HOLLIS_TOOLS } from './groq.js';
+import {
+  callGroqTextModel,
+  callWorkersAITextModel,
+  resolveGroqModel,
+  DEFAULT_WORKERS_AI_MODEL,
+  DEFAULT_GROQ_FALLBACK_MODEL,
+  HOLLIS_TOOLS,
+} from './groq.js';
 import { callOpenRouterVisionModel } from './openrouter.js';
 import { elementList, findElement, resolveInstalledApp } from './prompt.js';
 
@@ -365,6 +373,28 @@ function finalizeParameters(action, { engine, context }) {
 }
 
 /**
+ * Rate-limit memory (per Worker isolate, best effort): an engine that just answered 429 is tried
+ * last until its window passes, so every step of a task does not first burn a call on a limited key.
+ */
+const engineCooldowns = new Map();
+const DEFAULT_COOLDOWN_MS = 20_000;
+const MAX_COOLDOWN_MS = 300_000;
+
+function isCoolingDown(id) {
+  return (engineCooldowns.get(id) || 0) > Date.now();
+}
+
+function startCooldown(id, retryAfterMs) {
+  const wait = Math.min(MAX_COOLDOWN_MS, Math.max(1_000, retryAfterMs || DEFAULT_COOLDOWN_MS));
+  engineCooldowns.set(id, Date.now() + wait);
+}
+
+/** For tests. */
+export function resetEngineCooldowns() {
+  engineCooldowns.clear();
+}
+
+/**
  * Unified Decision Engine: decides the next action by evaluating tree quality, choosing the
  * preferred model (Text vs Vision), and falling back to the other one when it cannot be used.
  *
@@ -392,7 +422,8 @@ function finalizeParameters(action, { engine, context }) {
  *   log_message: string,
  *   is_completed: boolean,
  *   mode_used: 'text' | 'vision',
- *   engine_used: 'groq' | 'openrouter' | 'mock' | 'mock_fallback',
+ *   engine_used: 'groq' | 'workers-ai' | 'openrouter' | 'mock' | 'mock_fallback',
+ *   model_used: string | null,
  *   tree_quality: object
  * }>}
  */
@@ -409,43 +440,52 @@ export async function decide_action({
   const treeQuality = check_tree_quality(screen_tree);
   const preferredMode = options.forced_mode || treeQuality.mode; // 'text' | 'vision'
 
-  const mockForced = Boolean(options.force_mock || options.mockAction || options.mockSequence || options.simulate_loop);
+  const mockForced = Boolean(
+    options.force_mock || options.mockAction || options.mockSequence || options.simulate_loop || env?.FORCE_MOCK_AI === 'true'
+  );
   const mockAllowed = mockForced || env?.ALLOW_MOCK_AI === 'true';
 
   let action = null;
   let engineUsed = 'mock';
+  let modelUsed = null;
   let modeUsed = preferredMode;
   const failures = [];
 
   if (!mockForced) {
-    const canText = Boolean(env?.GROQ_API_KEY);
+    const canGroq = Boolean(env?.GROQ_API_KEY);
+    const canWorkersAI = Boolean(env?.AI) && typeof env.AI.run === 'function';
     const canVision = Boolean(env?.OPENROUTER_API_KEY) && Boolean(screenshot);
     // Text mode can run on a thin tree too, as long as there is at least one element to talk about.
     const hasElements = (elementList(screen_tree)?.length || 0) > 0 || (!elementList(screen_tree) && Boolean(screen_tree));
 
-    const text = {
+    const textArgs = { instruction, screen_tree, history, context, reasoningEffort: env.GROQ_REASONING_EFFORT || undefined };
+    const groqPrimary = resolveGroqModel(env.GROQ_MODEL);
+    const groqFallback = resolveGroqModel(env.GROQ_FALLBACK_MODEL || DEFAULT_GROQ_FALLBACK_MODEL);
+    const workersModel = env.CF_AI_MODEL || DEFAULT_WORKERS_AI_MODEL;
+
+    const textEngine = (engine, model, usable, call) => ({
+      id: `${engine}:${model}`,
       mode: 'text',
-      engine: 'groq',
-      usable: canText && hasElements,
-      run: () =>
-        callWithValidation(
-          (feedback) =>
-            callGroqTextModel({
-              apiKey: env.GROQ_API_KEY,
-              instruction,
-              screen_tree,
-              history,
-              context,
-              feedback,
-              model: env.GROQ_MODEL || undefined,
-              reasoningEffort: env.GROQ_REASONING_EFFORT || undefined,
-            }),
-          screen_tree
-        ),
-    };
+      engine,
+      model,
+      usable: usable && hasElements,
+      run: () => callWithValidation((feedback) => call({ ...textArgs, feedback, model }), screen_tree),
+    });
+
+    // Text chain: Groq 120b, then Cloudflare Workers AI 120b (separate quota), then the smaller Groq 20b.
+    const textChain = [
+      textEngine('groq', groqPrimary, canGroq, (a) => callGroqTextModel({ ...a, apiKey: env.GROQ_API_KEY })),
+      textEngine('workers-ai', workersModel, canWorkersAI, (a) => callWorkersAITextModel({ ...a, ai: env.AI })),
+      ...(groqFallback !== groqPrimary
+        ? [textEngine('groq', groqFallback, canGroq, (a) => callGroqTextModel({ ...a, apiKey: env.GROQ_API_KEY }))]
+        : []),
+    ];
+    const visionModel = env.OPENROUTER_MODEL || 'qwen/qwen-2.5-vl-72b-instruct';
     const vision = {
+      id: `openrouter:${visionModel}`,
       mode: 'vision',
       engine: 'openrouter',
+      model: visionModel,
       usable: canVision,
       run: () =>
         callWithValidation(
@@ -464,17 +504,24 @@ export async function decide_action({
         ),
     };
 
-    // Preferred engine first; the other one only if the first cannot be used or fails.
-    for (const candidate of preferredMode === 'text' ? [text, vision] : [vision, text]) {
-      if (!candidate.usable) continue;
+    // Preferred mode first; engines that just hit a rate limit go to the back of the line, not out of it.
+    const usable = (preferredMode === 'text' ? [...textChain, vision] : [vision, ...textChain]).filter((c) => c.usable);
+    const candidates = [...usable.filter((c) => !isCoolingDown(c.id)), ...usable.filter((c) => isCoolingDown(c.id))];
+
+    for (const candidate of candidates) {
       try {
         action = await candidate.run();
         engineUsed = candidate.engine;
+        modelUsed = candidate.model;
         modeUsed = candidate.mode;
+        if (failures.length > 0) {
+          console.warn(`[AIAdapter] Answered by fallback ${candidate.engine} (${candidate.model}) after: ${failures.join(' | ')}`);
+        }
         break;
       } catch (err) {
-        console.warn(`[AIAdapter] ${candidate.engine} failed:`, err.message);
-        failures.push(`${candidate.engine}: ${err.message}`);
+        console.warn(`[AIAdapter] ${candidate.engine} (${candidate.model}) failed:`, err.message);
+        failures.push(`${candidate.engine} (${candidate.model}): ${err.message}`);
+        if (err.isRateLimit) startCooldown(candidate.id, err.retryAfterMs);
       }
     }
 
@@ -482,10 +529,10 @@ export async function decide_action({
       if (failures.length > 0) {
         throw new AIEngineError('ai_unavailable', 'ระบบ AI ตอบกลับไม่สำเร็จ กรุณาลองใหม่อีกครั้ง', failures);
       }
-      if (!canText && !env?.OPENROUTER_API_KEY) {
+      if (!canGroq && !canWorkersAI && !env?.OPENROUTER_API_KEY) {
         throw new AIEngineError(
           'ai_not_configured',
-          'ระบบ AI ยังไม่ได้ตั้งค่า (ไม่มี GROQ_API_KEY / OPENROUTER_API_KEY บนเซิร์ฟเวอร์)'
+          'ระบบ AI ยังไม่ได้ตั้งค่า (ไม่มี GROQ_API_KEY / OPENROUTER_API_KEY / AI binding บนเซิร์ฟเวอร์)'
         );
       }
       throw new AIEngineError(
@@ -531,6 +578,7 @@ export async function decide_action({
     is_completed: toolName === 'task_finish' || Boolean(action.is_completed),
     mode_used: modeUsed,
     engine_used: engineUsed,
+    model_used: modelUsed,
     tree_quality: treeQuality,
   };
 }

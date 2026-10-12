@@ -913,7 +913,8 @@ class HollisAccessibilityService : AccessibilityService() {
 
 **Backend → Android**
 
-* `action` และ `log` มี `engine_used` (`groq` | `openrouter`; `mock`/`mock_fallback` เกิดได้เฉพาะเมื่อเซิร์ฟเวอร์เปิด `ALLOW_MOCK_AI`)
+* `action` และ `log` มี `engine_used` (`groq` | `workers-ai` | `openrouter`; `mock`/`mock_fallback` เกิดได้เฉพาะเมื่อเซิร์ฟเวอร์เปิด `ALLOW_MOCK_AI` / `FORCE_MOCK_AI`) และ `model_used` (ชื่อโมเดลจริง)
+* **สาย fallback ของ Text Mode** เมื่อโมเดลถูก rate limit (429) ล่ม หรือหมดเวลา จะสลับตามลำดับ: Groq `openai/gpt-oss-120b` → Cloudflare Workers AI `@cf/openai/gpt-oss-120b` (binding `AI`) → Groq `openai/gpt-oss-20b` โมเดลที่เพิ่งโดน 429 จะถูกพักไว้ท้ายคิวชั่วคราว (ตาม `Retry-After`, ไม่เกิน 5 นาที) ปรับได้ด้วย `GROQ_MODEL`, `CF_AI_MODEL`, `GROQ_FALLBACK_MODEL`
 * **`ai_error`** — AI ตัดสินใจไม่ได้ (ไม่ได้ตั้ง key, API ล่ม, อ่านหน้าจอไม่ได้) session จบเป็น `failed` แล้วปิด socket:
 
 ```json
@@ -922,4 +923,4 @@ class HollisAccessibilityService : AccessibilityService() {
 
   `code` = `ai_not_configured` | `ai_unavailable` | `ai_no_input`
 * `finished` มี `status: "failed"` เมื่อโมเดลเรียก `task_finish` ด้วย `status: "failed"`
-* `GET /health` มี `ai: { groq, openrouter, mock_allowed }` (boolean ว่าตั้ง key แล้วหรือยัง ไม่เปิดเผยค่า)
+* `GET /health` มี `ai: { groq, workers_ai, openrouter, mock_allowed }` (boolean ว่าตั้ง key แล้วหรือยัง ไม่เปิดเผยค่า)

@@ -20,3 +20,6 @@ OPENROUTER_API_KEY=
 # Tests / offline development ONLY. Never set these on a phone you actually use; they fake a successful task.
 # ALLOW_MOCK_AI=true   scripted mock answers when no real engine is configured or all of them fail
 # FORCE_MOCK_AI=true   always use the mock (needed by test_epic3.js, which expects scripted answers)
+
+# Debugging only: log every prompt (it contains what is on the user's screen) and decision to the Worker log.
+# DEBUG_AI=true

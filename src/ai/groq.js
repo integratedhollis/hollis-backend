@@ -5,7 +5,7 @@
  * targeting gpt-oss-120b with strict 7-tool schema per Mobile Agent Specification.
  */
 
-import { SYSTEM_PROMPT, buildUserPrompt } from './prompt.js';
+import { SYSTEM_PROMPT, buildUserPrompt, positionWord } from './prompt.js';
 
 const GROQ_COMPLETIONS_URL = 'https://api.groq.com/openai/v1/chat/completions';
 // Groq's id carries the vendor prefix; the bare "gpt-oss-120b" is answered with HTTP 404 model_not_found.
@@ -31,9 +31,10 @@ export const HOLLIS_TOOLS = [
         type: 'object',
         properties: {
           element_id: { type: 'integer', description: 'รหัสตัวเลขลำดับของ Element บนหน้าจอ (0, 1, 2, ...)' },
+          element_label: { type: 'string', description: 'ป้ายชื่อของ Element ที่เลือก คัดลอกจากรายการให้ตรงตัว (ถ้า Element ไม่มีป้ายชื่อให้ใส่ "")' },
           target_description: { type: 'string', description: 'คำอธิบายสั้นๆ ขององค์ประกอบที่กด เช่น ปุ่มส่งเงิน' },
         },
-        required: ['element_id'],
+        required: ['element_id', 'element_label'],
       },
     },
   },
@@ -62,6 +63,7 @@ export const HOLLIS_TOOLS = [
         type: 'object',
         properties: {
           element_id: { type: 'integer', description: 'รหัสตัวเลขประจำช่องกรอกข้อความ' },
+          element_label: { type: 'string', description: 'ป้ายชื่อของช่องกรอกที่เลือก คัดลอกจากรายการให้ตรงตัว (ถ้าไม่มีให้ใส่ "")' },
           text: { type: 'string', description: 'ข้อความที่ต้องการกรอก' },
         },
         required: ['element_id', 'text'],
@@ -145,14 +147,18 @@ export const HOLLIS_TOOLS = [
 /**
  * Formats pruned accessibility elements into a token-efficient One-line String format per Specification.
  * Example output:
- * [0] Button "ส่งเงิน" (clickable)
- * [1] EditText "ค้นหาเพื่อน" (editable)
+ * [0] Button "ส่งเงิน" #send_button @bottom-right (clickable)
+ * [1] EditText "ค้นหา" (clickable, editable)
+ *
+ * When the screen is longer than [maxNodes], every interactive element is kept and plain text is
+ * what gets dropped, so a tab bar at the end of the tree can never fall off the list.
  *
  * @param {any} screenTree - Accessibility tree or pruned element array
- * @param {number} [maxNodes=60]
+ * @param {number} [maxNodes=80]
+ * @param {{ w: number, h: number } | null} [screen] - Screen size in px; enables the @position hint
  * @returns {string}
  */
-export function formatElementsToOneLine(screenTree, maxNodes = 60) {
+export function formatElementsToOneLine(screenTree, maxNodes = 80, screen = null) {
   if (!screenTree) return 'No accessibility elements provided.';
 
   let root = screenTree;
@@ -174,8 +180,20 @@ export function formatElementsToOneLine(screenTree, maxNodes = 60) {
         : null;
 
   if (elementList) {
+    const isControl = (el) =>
+      Boolean(el && (el.clickable || el.is_clickable || el.editable || el.is_editable || el.checkable || el.is_checkable || el.scrollable));
+    let indexes = elementList.map((_, i) => i);
+    let omitted = 0;
+    if (indexes.length > maxNodes) {
+      const keep = new Set();
+      for (const i of indexes) if (isControl(elementList[i]) && keep.size < maxNodes) keep.add(i);
+      for (const i of indexes) if (!keep.has(i) && keep.size < maxNodes) keep.add(i);
+      omitted = indexes.length - keep.size;
+      indexes = [...keep].sort((x, y) => x - y);
+    }
+
     const lines = [];
-    for (let i = 0; i < Math.min(elementList.length, maxNodes); i++) {
+    for (const i of indexes) {
       const el = elementList[i];
       if (!el || typeof el !== 'object') continue;
       const id = el.id !== undefined ? el.id : i;
@@ -196,8 +214,12 @@ export function formatElementsToOneLine(screenTree, maxNodes = 60) {
       const textStr = text ? ` "${text}"` : '';
       const descStr = desc && desc !== text ? ` {${desc}}` : '';
       const hintStr = hint && hint !== text ? ` <${hint}>` : '';
-      lines.push(`[${id}] ${type}${textStr}${descStr}${hintStr}${traitStr}`);
+      const vidStr = el.vid ? ` #${el.vid}` : '';
+      const pos = positionWord(el, screen);
+      const posStr = pos ? ` @${pos}` : '';
+      lines.push(`[${id}] ${type}${textStr}${descStr}${hintStr}${vidStr}${posStr}${traitStr}`);
     }
+    if (omitted > 0) lines.push(`... ${omitted} more elements not shown`);
     return lines.length > 0 ? lines.join('\n') : 'Empty element tree';
   }
 
@@ -454,6 +476,7 @@ function assistantMessage(data) {
  * @param {string} [params.model]
  * @param {string} [params.reasoningEffort]
  * @param {number} [params.timeoutMs]
+ * @param {boolean} [params.debug] - log the full prompt (screen contents!)
  * @returns {Promise<object>} Normalized Action Object (see normalizeToolAction)
  */
 export async function callTextModel({
@@ -468,6 +491,7 @@ export async function callTextModel({
   model,
   reasoningEffort = 'medium',
   timeoutMs,
+  debug = false,
 }) {
   const isWorkersAI = provider === 'workers-ai';
   if (isWorkersAI) {
@@ -480,11 +504,13 @@ export async function callTextModel({
 
   const userContent = buildUserPrompt({
     instruction,
-    screenText: formatElementsToOneLine(screen_tree),
+    screenText: formatElementsToOneLine(screen_tree, undefined, context?.screen),
     history,
     context,
     feedback,
   });
+  // Opt-in (DEBUG_AI=true): the prompt holds what is on the user's screen, so it is never logged by default.
+  if (debug) console.log(`[AI prompt] ${provider} ${model}\n${userContent}`);
 
   // Only gpt-oss models accept reasoning_effort; other models would reject the request.
   const effort = /gpt-oss/i.test(model) ? reasoningEffort : null;

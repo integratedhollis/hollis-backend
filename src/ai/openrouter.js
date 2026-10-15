@@ -111,7 +111,7 @@ For click_coordinate, give x and y as FRACTIONS of the screenshot, each between 
 
   const promptText = `${buildUserPrompt({
     instruction,
-    screenText: formatElementsToOneLine(screen_tree),
+    screenText: formatElementsToOneLine(screen_tree, undefined, context?.screen),
     history,
     context,
     feedback,

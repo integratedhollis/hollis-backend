@@ -19,7 +19,14 @@ import {
   HOLLIS_TOOLS,
 } from './groq.js';
 import { callOpenRouterVisionModel } from './openrouter.js';
-import { elementList, findElement, resolveInstalledApp } from './prompt.js';
+import {
+  elementList,
+  findElement,
+  elementLabel,
+  describeElement,
+  labelsMatch,
+  resolveInstalledApp,
+} from './prompt.js';
 
 /**
  * Intelligent Mock Engine producing dynamic automation actions
@@ -325,17 +332,55 @@ export function validateDecision(action, screen_tree) {
   }
 }
 
-/** Calls an engine, and if its answer fails validation asks once more with the reason attached. */
+/**
+ * Catches the classic index slip: the model writes the label it MEANS in `element_label` but gives the
+ * id of a neighbouring element. Compares that copied label with the real label of the chosen id.
+ * This is a soft check: it earns one retry with a pointer to the right id, never a hard failure.
+ *
+ * @returns {string | null} feedback for the model, or null when the choice is consistent
+ */
+export function checkElementLabel(action, screen_tree) {
+  const tool = action?.tool_name || action?.action_type;
+  if (tool !== 'click_element' && tool !== 'input_text') return null;
+  const p = action.parameters || {};
+  const claimed = typeof p.element_label === 'string' ? p.element_label.trim() : '';
+  const list = elementList(screen_tree);
+  const element = findElement(screen_tree, p.element_id);
+  if (!claimed || !list || !element) return null;
+
+  const actual = elementLabel(element);
+  if (actual && labelsMatch(claimed, actual)) return null;
+
+  const elsewhere = list
+    .filter((el) => el && el !== element && labelsMatch(claimed, elementLabel(el)))
+    .map((el) => `[${el.id}]`)
+    .slice(0, 4);
+  const hint = elsewhere.length ? ` The element(s) labeled like that are ${elsewhere.join(', ')}.` : '';
+  return actual
+    ? `Element ${p.element_id} is labeled "${actual}", not "${claimed}".${hint} Use the id of the element you actually mean.`
+    : `Element ${p.element_id} has no label (${describeElement(element, null)}), but you wrote element_label "${claimed}".${hint} Use the id of the labeled element you mean, or set element_label to "" if you really want the unlabeled one.`;
+}
+
+/**
+ * Calls an engine, and if its answer fails validation asks once more with the reason attached.
+ * A hard problem (unknown tool, missing id) on the second try fails the engine; an element/label
+ * mismatch on the second try is accepted, so an inconsistent model can slow a step but never stop it.
+ */
 async function callWithValidation(call, screen_tree) {
   let feedback = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     const action = await call(feedback);
-    const problem = validateDecision(action, screen_tree);
-    if (!problem) return action;
-    console.warn(`[AIAdapter] Invalid tool call (attempt ${attempt + 1}): ${problem}`);
-    feedback = problem;
+    const hard = validateDecision(action, screen_tree);
+    const soft = hard ? null : checkElementLabel(action, screen_tree);
+    if (!hard && !soft) return action;
+    console.warn(`[AIAdapter] ${hard ? 'Invalid' : 'Inconsistent'} tool call (attempt ${attempt + 1}): ${hard || soft}`);
+    if (attempt === 1) {
+      if (hard) throw new Error(`Model returned an invalid tool call twice: ${hard}`);
+      return action;
+    }
+    feedback = hard || soft;
   }
-  throw new Error(`Model returned an invalid tool call twice: ${feedback}`);
+  throw new Error('unreachable');
 }
 
 /** Fixes up a validated decision: real package for open_app, device pixels for vision taps, clamped waits. */
@@ -458,7 +503,14 @@ export async function decide_action({
     // Text mode can run on a thin tree too, as long as there is at least one element to talk about.
     const hasElements = (elementList(screen_tree)?.length || 0) > 0 || (!elementList(screen_tree) && Boolean(screen_tree));
 
-    const textArgs = { instruction, screen_tree, history, context, reasoningEffort: env.GROQ_REASONING_EFFORT || undefined };
+    const textArgs = {
+      instruction,
+      screen_tree,
+      history,
+      context,
+      reasoningEffort: env.GROQ_REASONING_EFFORT || undefined,
+      debug: env.DEBUG_AI === 'true',
+    };
     const groqPrimary = resolveGroqModel(env.GROQ_MODEL);
     const groqFallback = resolveGroqModel(env.GROQ_FALLBACK_MODEL || DEFAULT_GROQ_FALLBACK_MODEL);
     const workersModel = env.CF_AI_MODEL || DEFAULT_WORKERS_AI_MODEL;
@@ -560,6 +612,13 @@ export async function decide_action({
   const isMock = engineUsed === 'mock' || engineUsed === 'mock_fallback';
   const parameters = isMock ? action.parameters || {} : finalizeParameters(action, { engine: engineUsed, context });
 
+  // What the chosen id really is on this screen (the model's own description can be wrong).
+  const targetElement = findElement(screen_tree, parameters.element_id);
+  const resolvedLabel = targetElement ? describeElement(targetElement, context?.screen) : null;
+  if (env?.DEBUG_AI === 'true') {
+    console.log(`[AI decision] ${engineUsed} ${modelUsed} -> ${toolName} ${JSON.stringify(parameters)}${resolvedLabel ? ` = ${resolvedLabel}` : ''}`);
+  }
+
   return {
     action_type: toolName,
     tool_name: toolName,
@@ -579,6 +638,7 @@ export async function decide_action({
     mode_used: modeUsed,
     engine_used: engineUsed,
     model_used: modelUsed,
+    resolved_label: resolvedLabel,
     tree_quality: treeQuality,
   };
 }

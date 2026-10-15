@@ -467,6 +467,12 @@ export class AgentLoop {
           break;
         }
 
+        // Say which element the id really is. The model's own words ("search button") can disagree with
+        // its id, and this makes such a mix-up visible in the chat, the stored log and the phone's logcat.
+        if (decision.resolved_label && (decision.tool_name === 'click_element' || decision.tool_name === 'input_text')) {
+          decision.log_message = `${decision.log_message} → ${decision.resolved_label}`;
+        }
+
         // Step 3: RISK CHECK
         const riskResult = check_risk(buildRiskSubject(decision, stateBefore.screen_tree));
         const isRisky = riskResult.is_risky;
@@ -598,6 +604,7 @@ export class AgentLoop {
           mode_used: decision.mode_used,
           engine_used: decision.engine_used,
           model_used: decision.model_used,
+          resolved_label: decision.resolved_label,
           is_risky: isRisky,
         });
 

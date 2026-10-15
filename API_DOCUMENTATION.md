@@ -908,6 +908,8 @@ class HollisAccessibilityService : AccessibilityService() {
 | `installed_apps: [{ "name", "package" }]` | แอปที่มี launcher icon (ส่งใน `observe` แรก) AI เลือก `open_app` จากรายชื่อนี้ |
 | `status`, `message` (ใน `action_done`) | `ok`/`error` และเหตุผลที่ล้มเหลว — backend ส่งให้โมเดลเห็นในขั้นถัดไป |
 | ใน `screen_elements[]` | `desc` (content description เมื่อต่างจาก `text`), `hint`, `checked`, `scrollable`, `selected`, `enabled:false` |
+| ใน `screen_elements[]` (ตำแหน่งและชื่อ) | `bounds: [left, top, right, bottom]` เป็นพิกเซล และ `vid` (ชื่อ resource id ของ view เช่น `navigate_up`) — backend ใช้แปลงเป็น `@top-left` / `@bottom-center` ใน prompt |
+| ชื่อของปุ่ม | ปุ่มที่กดได้แต่ไม่มีข้อความของตัวเอง จะได้ชื่อจากข้อความ/คำอธิบายของ view ลูกที่อยู่ข้างใน (เหมือน TalkBack) และลูกเหล่านั้นจะไม่ถูกส่งซ้ำเป็น element แยก เว้นแต่ปุ่มนั้นเป็นเพียง layout ครอบปุ่มอื่นตั้งแต่ 3 ปุ่มขึ้นไป |
 
 หน้าจอส่งได้ทั้ง `screen_elements` (array แบนตามเอกสาร) และ `screen_tree` (รูปแบบเดิม)
 
@@ -922,5 +924,8 @@ class HollisAccessibilityService : AccessibilityService() {
 ```
 
   `code` = `ai_not_configured` | `ai_unavailable` | `ai_no_input`
+* `click_element` / `input_text` รับ `element_label` (ป้ายชื่อของ element ที่เลือก คัดลอกจากรายการ) backend เทียบกับป้ายชื่อจริงของ `element_id` ถ้าไม่ตรงจะให้โมเดลตอบใหม่ 1 ครั้งพร้อมบอก id ที่น่าจะถูก (ถ้ายังไม่ตรงก็ยอมรับ ไม่ทำให้ task ล้ม)
+* frame `action` มี `resolved_label` (element ที่ id นั้นคืออะไรจริง เช่น `"Clear" #clear_button @top-right`) และ `log_message` ต่อท้ายด้วยค่านี้ (`... (search button) → "Clear" @top-right`) ทำให้เห็นทันทีเมื่อคำอธิบายของโมเดลไม่ตรงกับ element ที่กด
+* ตั้ง `DEBUG_AI=true` บน server เพื่อ log prompt (รวมข้อความบนหน้าจอผู้ใช้) และการตัดสินใจทุกขั้น ปิดไว้เป็นค่าเริ่มต้น
 * `finished` มี `status: "failed"` เมื่อโมเดลเรียก `task_finish` ด้วย `status: "failed"`
 * `GET /health` มี `ai: { groq, workers_ai, openrouter, mock_allowed }` (boolean ว่าตั้ง key แล้วหรือยัง ไม่เปิดเผยค่า)
